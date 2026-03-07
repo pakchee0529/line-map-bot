@@ -1,7 +1,27 @@
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from flask import Flask, request, abort
+import json
+import os
 import unicodedata
 import re
 import difflib
+
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.exceptions import InvalidSignatureError
+
+
+app = Flask(__name__)
+
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
+
+
+with open("coords.json", "r", encoding="utf-8") as f:
+    coords = json.load(f)
+
 
 def normalize(text):
 
@@ -12,15 +32,27 @@ def normalize(text):
     return text
 
 
+@app.route("/callback", methods=['POST'])
+def callback():
+
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+
+    return 'OK'
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
 
     user_text = normalize(event.message.text)
 
-    # 正規化辞書作成
     normalized_map = {normalize(k): k for k in coords.keys()}
 
-    # 完全一致
     if user_text in normalized_map:
 
         key = normalized_map[user_text]
@@ -50,7 +82,6 @@ def handle_text(event):
                     candidate = normalized_map[key_try]
                     break
 
-        # 部分一致
         if candidate is None:
 
             base = re.sub(r"N\d+", "", user_text)
@@ -61,7 +92,6 @@ def handle_text(event):
                     candidate = original
                     break
 
-        # 類似検索
         if candidate is None:
 
             close = difflib.get_close_matches(user_text, normalized_map.keys(), n=1, cutoff=0.6)
@@ -90,3 +120,7 @@ def handle_text(event):
         event.reply_token,
         TextSendMessage(text=text)
     )
+
+
+if __name__ == "__main__":
+    app.run()
