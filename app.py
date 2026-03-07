@@ -47,17 +47,31 @@ def handle_location(event):
     user_lat = event.message.latitude
     user_lon = event.message.longitude
 
-    nearest = None
+    nearest_name = None
+    nearest_lat = None
+    nearest_lon = None
     min_dist = 999999999
 
-    for c in coords:
-        d = distance(user_lat, user_lon, c["lat"], c["lon"])
+    for name, coord in coords.items():
+
+        lat_str, lon_str = coord.split(",")
+
+        lat = float(lat_str)
+        lon = float(lon_str)
+
+        d = distance(user_lat, user_lon, lat, lon)
 
         if d < min_dist:
             min_dist = d
-            nearest = c
+            nearest_name = name
+            nearest_lat = lat
+            nearest_lon = lon
 
-    text = f"最寄り地点\n{nearest['name']}\n距離: {int(min_dist)}m"
+    text = f"""最寄り地点
+{nearest_name}
+距離: {int(min_dist)}m
+https://www.google.com/maps?q={nearest_lat},{nearest_lon}
+"""
 
     line_bot_api.reply_message(
         event.reply_token,
@@ -67,3 +81,4 @@ def handle_location(event):
 
 if __name__ == "__main__":
     app.run()
+
