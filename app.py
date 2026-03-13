@@ -19,7 +19,6 @@ handler = WebhookHandler(CHANNEL_SECRET)
 with open("coords.json", "r", encoding="utf-8") as f:
     coords = json.load(f)
 
-BRANCH_LETTERS = "WNESG"
 NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
 RANGE_PATTERN = re.compile(r"[～~]")
 POLE_PATTERN = re.compile(r"^(.*?)(\d+)((?:[WNESG]\d+)*)$")
@@ -45,6 +44,7 @@ def split_input_lines(text: str):
 
 
 def make_display_name(text: str) -> str:
+    # 表示用径間名はスペース削除のみ、～以降は削除しない
     return remove_spaces(normalize_text(text))
 
 
@@ -89,28 +89,31 @@ def build_pole_name(place: str, parent: int, branches):
     return s
 
 
-def apply_g9_special_rule(name: str) -> str:
+def is_hazard_g9_candidate(place: str, parent: int, prefix_branches=None) -> bool:
     """
-    末尾G9で、同一親番号・同一階層にG8/G10が無い場合は
-    G9を枝番号と見なさず削除する
-    例: 葛川25G9 -> 葛川25
+    G9危険地帯特例が使えるか判定する
+    条件:
+      - 同一親番号・同一階層の G9 が存在
+      - 同一親番号・同一階層の G8 / G10 が存在しない
     """
-    parsed = parse_pole_name(name)
-    if not parsed or not parsed["branches"]:
-        return name
+    if prefix_branches is None:
+        prefix_branches = []
 
-    last_letter, last_num = parsed["branches"][-1]
-    if last_letter != "G" or last_num != 9:
-        return name
+    g9 = build_pole_name(place, parent, prefix_branches + [("G", 9)])
+    g8 = build_pole_name(place, parent, prefix_branches + [("G", 8)])
+    g10 = build_pole_name(place, parent, prefix_branches + [("G", 10)])
 
-    prefix_branches = parsed["branches"][:-1]
-    key_g8 = build_pole_name(parsed["place"], parsed["parent"], prefix_branches + [("G", 8)])
-    key_g10 = build_pole_name(parsed["place"], parsed["parent"], prefix_branches + [("G", 10)])
+    if g9 not in coords:
+        return False
+    if g8 in coords or g10 in coords:
+        return False
+    return True
 
-    if key_g8 in coords or key_g10 in coords:
-        return name
 
-    return build_pole_name(parsed["place"], parsed["parent"], prefix_branches)
+def hazard_g9_name(place: str, parent: int, prefix_branches=None):
+    if prefix_branches is None:
+        prefix_branches = []
+    return build_pole_name(place, parent, prefix_branches + [("G", 9)])
 
 
 def complete_back_key(front_raw: str, back_raw: str):
@@ -123,12 +126,9 @@ def complete_back_key(front_raw: str, back_raw: str):
       那智合12N1G1～12N2 -> 那智合12N2
       大日川1N9E1G1～E1G2 -> 大日川1N9E1G2
     """
-    front_raw = apply_g9_special_rule(front_raw)
     front = parse_pole_name(front_raw)
     if not front:
         return None
-
-    back_raw = apply_g9_special_rule(back_raw)
 
     # 完全な電柱名ならそのまま
     back_full = parse_pole_name(back_raw)
@@ -141,7 +141,7 @@ def complete_back_key(front_raw: str, back_raw: str):
         parent = int(m_num.group(1))
         branch_str = m_num.group(2)
         branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", branch_str)]
-        return apply_g9_special_rule(build_pole_name(front["place"], parent, branches))
+        return build_pole_name(front["place"], parent, branches)
 
     # 枝だけ: E1G2 のようなケース
     m_branch_only = re.match(r"^((?:[WNESG]\d+)+)$", back_raw)
@@ -166,12 +166,10 @@ def complete_back_key(front_raw: str, back_raw: str):
         if matched_index is not None:
             prefix = front_branches[:matched_index]
         else:
-            # 同じ枝記号が無ければ前側階層をそのまま前置
+            # 同じ枝記号・番号が無ければ前側階層をそのまま前置
             prefix = front_branches
 
-        return apply_g9_special_rule(
-            build_pole_name(front["place"], front["parent"], prefix + back_branches)
-        )
+        return build_pole_name(front["place"], front["parent"], prefix + back_branches)
 
     return None
 
@@ -190,7 +188,7 @@ def create_search_keys(line: str):
 
     parts = RANGE_PATTERN.split(display_name, maxsplit=1)
     if len(parts) == 1:
-        front_key = apply_g9_special_rule(parts[0])
+        front_key = parts[0]
         return {
             "display_name": display_name,
             "is_range": False,
@@ -202,7 +200,7 @@ def create_search_keys(line: str):
     front_raw = parts[0]
     back_raw = parts[1]
 
-    front_key = apply_g9_special_rule(front_raw)
+    front_key = front_raw
     back_key = complete_back_key(front_raw, back_raw)
 
     return {
@@ -288,9 +286,14 @@ def sibling_branch_search(name: str):
 
 def parent_only_candidates(name: str):
     """
-    親番号のみ入力時
+    親番号のみ入力時の探索順
+
     例:
       葛川25
+      ↓
+      葛川25
+      ↓
+      葛川25G9（ただし 葛川25G8 / 葛川25G10 が無い場合のみ）
       ↓
       葛川26, 葛川24
       ↓
@@ -311,39 +314,49 @@ def parent_only_candidates(name: str):
     place = parsed["place"]
     parent = parsed["parent"]
 
+    # 1) 危険地帯G9特例
+    if is_hazard_g9_candidate(place, parent):
+        result.append(hazard_g9_name(place, parent))
+
+    # 2) 前後番号 → 同番号枝 → さらに前後
     for d in range(1, 6):
         plus_name = build_pole_name(place, parent + d, [])
         minus_name = build_pole_name(place, parent - d, []) if parent - d > 0 else None
 
-        if plus_name:
-            result.append(plus_name)
-        if minus_name:
-            result.append(minus_name)
-
         if d == 1:
+            if plus_name:
+                result.append(plus_name)
+            if minus_name:
+                result.append(minus_name)
+
             for letter in ["W", "E", "N", "S", "G"]:
                 result.append(build_pole_name(place, parent, [(letter, 1)]))
+        else:
+            if plus_name:
+                result.append(plus_name)
+            if minus_name:
+                result.append(minus_name)
 
     return result
 
 
-def general_search_order(name: str):
+def non_parent_general_candidates(name: str):
     """
-    元構造に近い順
+    親番号のみ以外の探索順
     1 完全一致
     2 末尾枝近傍探索
     3 枝削減
     4 同階層枝探索
-    5 親番号探索
     """
+    parsed = parse_pole_name(name)
+    if not parsed:
+        return [name]
+
     seen = set()
     result = []
 
     def add(x):
-        if not x:
-            return
-        x = apply_g9_special_rule(x)
-        if x not in seen:
+        if x and x not in seen:
             seen.add(x)
             result.append(x)
 
@@ -358,10 +371,31 @@ def general_search_order(name: str):
     for x in sibling_branch_search(name):
         add(x)
 
-    for x in parent_only_candidates(name):
-        add(x)
-
     return result
+
+
+def general_search_order(name: str):
+    parsed = parse_pole_name(name)
+    if not parsed:
+        return [name]
+
+    if not parsed["branches"]:
+        seen = set()
+        result = []
+
+        def add(x):
+            if x and x not in seen:
+                seen.add(x)
+                result.append(x)
+
+        # 親番号のみは
+        # 完全一致 → G9特例 → 前後番号 → 枝 → さらに前後...
+        add(name)
+        for x in parent_only_candidates(name):
+            add(x)
+        return result
+
+    return non_parent_general_candidates(name)
 
 
 def find_first_existing(candidates):
