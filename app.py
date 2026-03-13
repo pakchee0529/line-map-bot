@@ -1,23 +1,47 @@
-from flask import Flask, request, abort
+from flask import Flask, request, abort, render_template, jsonify
 import json
 import os
 import unicodedata
 import re
+import math
+from urllib.parse import urlencode
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import (
+    MessageEvent,
+    TextMessage,
+    TextSendMessage,
+    LocationMessage,
+)
 from linebot.exceptions import InvalidSignatureError
 
 app = Flask(__name__)
 
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
 with open("coords.json", "r", encoding="utf-8") as f:
     coords = json.load(f)
+
+# 高速検索用の前処理
+pole_points = []
+for pole_name, latlon in coords.items():
+    try:
+        lat_str, lng_str = latlon.split(",")
+        lat = float(lat_str)
+        lng = float(lng_str)
+        pole_points.append({
+            "name": pole_name,
+            "lat": lat,
+            "lng": lng,
+            "latlon": latlon,
+        })
+    except Exception:
+        continue
 
 NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
 RANGE_PATTERN = re.compile(r"[～~]")
@@ -44,7 +68,6 @@ def split_input_lines(text: str):
 
 
 def make_display_name(text: str) -> str:
-    # 表示用径間名はスペース削除のみ、～以降は削除しない
     return remove_spaces(normalize_text(text))
 
 
@@ -57,12 +80,6 @@ def google_maps_url(latlon: str) -> str:
 
 
 def parse_pole_name(name: str):
-    """
-    例:
-      葛川25 -> place=葛川, parent=25, branches=[]
-      那智合12N1G1 -> place=那智合, parent=12, branches=[('N',1),('G',1)]
-      大日川1N9E1G1 -> place=大日川, parent=1, branches=[('N',9),('E',1),('G',1)]
-    """
     m = POLE_PATTERN.match(name)
     if not m:
         return None
@@ -91,10 +108,12 @@ def build_pole_name(place: str, parent: int, branches):
 
 def is_hazard_g9_candidate(place: str, parent: int, prefix_branches=None) -> bool:
     """
-    G9危険地帯特例が使えるか判定する
-    条件:
-      - 同一親番号・同一階層の G9 が存在
-      - 同一親番号・同一階層の G8 / G10 が存在しない
+    親番号のみ検索時の G9 特例
+    例:
+      葛川25 が無い
+      葛川25G9 がある
+      葛川25G8 / 葛川25G10 が無い
+      -> 葛川25G9 を優先候補にする
     """
     if prefix_branches is None:
         prefix_branches = []
@@ -118,8 +137,6 @@ def hazard_g9_name(place: str, parent: int, prefix_branches=None):
 
 def complete_back_key(front_raw: str, back_raw: str):
     """
-    前側と後側から後側キーを補完する
-
     例:
       葛川25～26 -> 葛川26
       葛川17W2～17W3 -> 葛川17W3
@@ -130,12 +147,10 @@ def complete_back_key(front_raw: str, back_raw: str):
     if not front:
         return None
 
-    # 完全な電柱名ならそのまま
     back_full = parse_pole_name(back_raw)
     if back_full and back_full["place"]:
         return build_pole_name(back_full["place"], back_full["parent"], back_full["branches"])
 
-    # 数字始まり: 26 / 17W3 / 12N2
     m_num = re.match(r"^(\d+)((?:[WNESG]\d+)*)$", back_raw)
     if m_num:
         parent = int(m_num.group(1))
@@ -143,7 +158,6 @@ def complete_back_key(front_raw: str, back_raw: str):
         branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", branch_str)]
         return build_pole_name(front["place"], parent, branches)
 
-    # 枝だけ: E1G2 のようなケース
     m_branch_only = re.match(r"^((?:[WNESG]\d+)+)$", back_raw)
     if m_branch_only:
         back_branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", back_raw)]
@@ -166,7 +180,6 @@ def complete_back_key(front_raw: str, back_raw: str):
         if matched_index is not None:
             prefix = front_branches[:matched_index]
         else:
-            # 同じ枝記号・番号が無ければ前側階層をそのまま前置
             prefix = front_branches
 
         return build_pole_name(front["place"], front["parent"], prefix + back_branches)
@@ -175,14 +188,6 @@ def complete_back_key(front_raw: str, back_raw: str):
 
 
 def create_search_keys(line: str):
-    """
-    戻り値:
-      display_name
-      is_range
-      hikikomi
-      front_key
-      back_key
-    """
     display_name = make_display_name(line)
     hikikomi = has_hikikomi(display_name)
 
@@ -219,10 +224,6 @@ def exact_match(name: str):
 
 
 def branch_neighbors(name: str):
-    """
-    末尾枝近傍探索
-    +1, -1, +2, -2, +3, -3
-    """
     parsed = parse_pole_name(name)
     if not parsed or not parsed["branches"]:
         return []
@@ -242,11 +243,6 @@ def branch_neighbors(name: str):
 
 
 def branch_reduction(name: str):
-    """
-    枝削減
-    例:
-      那智合12N1G1 -> 那智合12N1 -> 那智合12
-    """
     parsed = parse_pole_name(name)
     if not parsed or not parsed["branches"]:
         return []
@@ -262,11 +258,6 @@ def branch_reduction(name: str):
 
 
 def sibling_branch_search(name: str):
-    """
-    同階層枝探索
-    例:
-      葛川25W1 -> 葛川25W2, 葛川25W3...
-    """
     parsed = parse_pole_name(name)
     if not parsed or not parsed["branches"]:
         return []
@@ -286,39 +277,29 @@ def sibling_branch_search(name: str):
 
 def parent_only_candidates(name: str):
     """
-    親番号のみ入力時の探索順
-
+    親番号のみ入力時
     例:
       葛川25
       ↓
-      葛川25
-      ↓
-      葛川25G9（ただし 葛川25G8 / 葛川25G10 が無い場合のみ）
+      葛川25G9（G8/G10が無いときだけ）
       ↓
       葛川26, 葛川24
       ↓
       葛川25W1, 葛川25E1, 葛川25N1, 葛川25S1, 葛川25G1
       ↓
-      葛川27, 葛川23
-      ↓
-      葛川28, 葛川22 ...
+      葛川27, 葛川23 ...
     """
     parsed = parse_pole_name(name)
-    if not parsed:
-        return []
-
-    if parsed["branches"]:
+    if not parsed or parsed["branches"]:
         return []
 
     result = []
     place = parsed["place"]
     parent = parsed["parent"]
 
-    # 1) 危険地帯G9特例
     if is_hazard_g9_candidate(place, parent):
         result.append(hazard_g9_name(place, parent))
 
-    # 2) 前後番号 → 同番号枝 → さらに前後
     for d in range(1, 6):
         plus_name = build_pole_name(place, parent + d, [])
         minus_name = build_pole_name(place, parent - d, []) if parent - d > 0 else None
@@ -341,13 +322,6 @@ def parent_only_candidates(name: str):
 
 
 def non_parent_general_candidates(name: str):
-    """
-    親番号のみ以外の探索順
-    1 完全一致
-    2 末尾枝近傍探索
-    3 枝削減
-    4 同階層枝探索
-    """
     parsed = parse_pole_name(name)
     if not parsed:
         return [name]
@@ -388,8 +362,6 @@ def general_search_order(name: str):
                 seen.add(x)
                 result.append(x)
 
-        # 親番号のみは
-        # 完全一致 → G9特例 → 前後番号 → 枝 → さらに前後...
         add(name)
         for x in parent_only_candidates(name):
             add(x)
@@ -416,7 +388,7 @@ def resolve_one(line: str):
     adopted = None
     preferred_key = None
 
-    # 径間探索優先順位
+    # 径間:
     # ① 後側完全一致
     # ② 前側完全一致
     # ③ 後側近傍探索
@@ -486,6 +458,97 @@ def resolve_message(text: str) -> str:
     return "\n\n".join(blocks)
 
 
+def haversine_m(lat1, lng1, lat2, lng2):
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+
+def find_nearby_poles(lat: float, lng: float, radius_m: float = 200):
+    """
+    高速版:
+    1. 半径を緯度経度の矩形に変換
+    2. 矩形に入る候補だけ絞る
+    3. その候補だけ厳密距離計算
+    """
+    result = []
+
+    lat_delta = radius_m / 111320.0
+
+    cos_lat = math.cos(math.radians(lat))
+    if abs(cos_lat) < 1e-12:
+        lng_delta = 180.0
+    else:
+        lng_delta = radius_m / (111320.0 * cos_lat)
+
+    min_lat = lat - lat_delta
+    max_lat = lat + lat_delta
+    min_lng = lng - lng_delta
+    max_lng = lng + lng_delta
+
+    rough_candidates = []
+    for pole in pole_points:
+        if min_lat <= pole["lat"] <= max_lat and min_lng <= pole["lng"] <= max_lng:
+            rough_candidates.append(pole)
+
+    for pole in rough_candidates:
+        dist = haversine_m(lat, lng, pole["lat"], pole["lng"])
+        if dist <= radius_m:
+            result.append({
+                "name": pole["name"],
+                "lat": pole["lat"],
+                "lng": pole["lng"],
+                "distance_m": round(dist, 1),
+                "google_maps_url": f"https://www.google.com/maps?q={pole['lat']},{pole['lng']}"
+            })
+
+    result.sort(key=lambda x: x["distance_m"])
+    return result
+
+
+@app.route("/nearby")
+def nearby_page():
+    lat = request.args.get("lat", type=float)
+    lng = request.args.get("lng", type=float)
+    radius = request.args.get("radius", default=200, type=float)
+
+    if lat is None or lng is None:
+        return "lat / lng が必要です", 400
+
+    nearby = find_nearby_poles(lat, lng, radius)
+    return render_template(
+        "nearby_map.html",
+        center_lat=lat,
+        center_lng=lng,
+        radius=radius,
+        nearby=nearby
+    )
+
+
+@app.route("/api/nearby")
+def nearby_api():
+    lat = request.args.get("lat", type=float)
+    lng = request.args.get("lng", type=float)
+    radius = request.args.get("radius", default=200, type=float)
+
+    if lat is None or lng is None:
+        return jsonify({"error": "lat / lng required"}), 400
+
+    nearby = find_nearby_poles(lat, lng, radius)
+    return jsonify({
+        "center": {"lat": lat, "lng": lng},
+        "radius": radius,
+        "count": len(nearby),
+        "poles": nearby
+    })
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -503,6 +566,41 @@ def callback():
 def handle_text(event):
     user_text = event.message.text
     reply_text = resolve_message(user_text)
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+
+@handler.add(MessageEvent, message=LocationMessage)
+def handle_location(event):
+    lat = event.message.latitude
+    lng = event.message.longitude
+    radius = 200
+
+    nearby = find_nearby_poles(lat, lng, radius)
+
+    if BASE_URL:
+        query = urlencode({
+            "lat": lat,
+            "lng": lng,
+            "radius": radius
+        })
+        map_url = f"{BASE_URL}/nearby?{query}"
+    else:
+        map_url = "(BASE_URL未設定)"
+
+    lines = [f"現在地周囲{radius}mの電柱: {len(nearby)}件", map_url]
+
+    if nearby:
+        lines.append("")
+        for pole in nearby[:15]:
+            lines.append(f"{pole['name']} {pole['distance_m']}m")
+        if len(nearby) > 15:
+            lines.append(f"…ほか {len(nearby) - 15}件")
+
+    reply_text = "\n".join(lines)
 
     line_bot_api.reply_message(
         event.reply_token,
