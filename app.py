@@ -4,6 +4,9 @@ import os
 import unicodedata
 import re
 import math
+import urllib.parse
+import urllib.request
+import urllib.error
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -113,6 +116,48 @@ def find_nearby(lat, lng, radius=200):
 
     result.sort(key=lambda x: x["distance"])
     return result
+
+
+def geocode_address(address: str):
+    """
+    住所を座標に変換する
+    Nominatim free-form search を利用
+    """
+    query = urllib.parse.urlencode({
+        "q": address,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "jp",
+        "addressdetails": 0,
+    })
+
+    url = f"https://nominatim.openstreetmap.org/search?{query}"
+
+    # 公開Nominatimは識別可能なUser-Agentが必要
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "line-map-bot/1.0 (LINE bot pole map)"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    if not data:
+        return None
+
+    try:
+        item = data[0]
+        lat = float(item["lat"])
+        lng = float(item["lon"])
+        display_name = item.get("display_name", address)
+        return lat, lng, display_name
+    except Exception:
+        return None
 
 
 def parse_pole_name(name: str):
@@ -463,6 +508,11 @@ def resolve_message(text: str) -> str:
     return "\n\n".join(blocks)
 
 
+@app.route("/")
+def index():
+    return "LINE pole map bot is running."
+
+
 @app.route("/map")
 def map_view():
     lat = request.args.get("lat", type=float)
@@ -498,8 +548,8 @@ def callback():
 def handle_text(event):
     user_text = event.message.text.strip()
 
+    # 1) 緯度経度
     parsed = parse_latlng(user_text)
-
     if parsed:
         lat, lng = parsed
         nearby = find_nearby(lat, lng, 200)
@@ -510,8 +560,46 @@ def handle_text(event):
             reply_text = f"周辺200mの電柱地図です\n件数: {len(nearby)}件\n{map_url}"
         else:
             reply_text = f"200m以内に電柱が見つかりませんでした\n{map_url}"
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+        return
+
+    # 2) 径間名
+    span_reply = resolve_message(user_text)
+    if "該当なし" not in span_reply:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=span_reply)
+        )
+        return
+
+    # 3) 住所
+    geo = geocode_address(user_text)
+    if geo:
+        lat, lng, address_name = geo
+        nearby = find_nearby(lat, lng, 200)
+        base_url = os.getenv("BASE_URL", "").rstrip("/")
+        map_url = f"{base_url}/map?lat={lat}&lng={lng}"
+
+        if nearby:
+            reply_text = (
+                f"住所を座標に変換しました\n"
+                f"{address_name}\n"
+                f"件数: {len(nearby)}件\n"
+                f"{map_url}"
+            )
+        else:
+            reply_text = (
+                f"住所を座標に変換しました\n"
+                f"{address_name}\n"
+                f"200m以内に電柱が見つかりませんでした\n"
+                f"{map_url}"
+            )
     else:
-        reply_text = resolve_message(user_text)
+        reply_text = span_reply
 
     line_bot_api.reply_message(
         event.reply_token,
