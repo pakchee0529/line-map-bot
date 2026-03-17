@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, LocationMessage
 from linebot.exceptions import InvalidSignatureError
 
 app = Flask(__name__)
@@ -119,10 +119,6 @@ def find_nearby(lat, lng, radius=200):
 
 
 def geocode_address(address: str):
-    """
-    住所を座標に変換する
-    Nominatim free-form search を利用
-    """
     query = urllib.parse.urlencode({
         "q": address,
         "format": "jsonv2",
@@ -133,7 +129,6 @@ def geocode_address(address: str):
 
     url = f"https://nominatim.openstreetmap.org/search?{query}"
 
-    # 公開Nominatimは識別可能なUser-Agentが必要
     req = urllib.request.Request(
         url,
         headers={
@@ -144,7 +139,7 @@ def geocode_address(address: str):
     try:
         with urllib.request.urlopen(req, timeout=10) as res:
             data = json.loads(res.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+    except Exception:
         return None
 
     if not data:
@@ -158,6 +153,30 @@ def geocode_address(address: str):
         return lat, lng, display_name
     except Exception:
         return None
+
+
+def build_map_url(lat, lng):
+    base_url = os.getenv("BASE_URL", "").rstrip("/")
+    return f"{base_url}/map?lat={lat}&lng={lng}"
+
+
+def build_nearby_map_reply(lat, lng, header=None):
+    nearby = find_nearby(lat, lng, 200)
+    map_url = build_map_url(lat, lng)
+
+    lines = []
+    if header:
+        lines.append(header)
+
+    if nearby:
+        lines.append("周辺200mの電柱地図です")
+        lines.append(f"件数: {len(nearby)}件")
+        lines.append(map_url)
+    else:
+        lines.append("200m以内に電柱が見つかりませんでした")
+        lines.append(map_url)
+
+    return "\n".join(lines)
 
 
 def parse_pole_name(name: str):
@@ -548,26 +567,16 @@ def callback():
 def handle_text(event):
     user_text = event.message.text.strip()
 
-    # 1) 緯度経度
     parsed = parse_latlng(user_text)
     if parsed:
         lat, lng = parsed
-        nearby = find_nearby(lat, lng, 200)
-        base_url = os.getenv("BASE_URL", "").rstrip("/")
-        map_url = f"{base_url}/map?lat={lat}&lng={lng}"
-
-        if nearby:
-            reply_text = f"周辺200mの電柱地図です\n件数: {len(nearby)}件\n{map_url}"
-        else:
-            reply_text = f"200m以内に電柱が見つかりませんでした\n{map_url}"
-
+        reply_text = build_nearby_map_reply(lat, lng)
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=reply_text)
         )
         return
 
-    # 2) 径間名
     span_reply = resolve_message(user_text)
     if "該当なし" not in span_reply:
         line_bot_api.reply_message(
@@ -576,30 +585,37 @@ def handle_text(event):
         )
         return
 
-    # 3) 住所
     geo = geocode_address(user_text)
     if geo:
         lat, lng, address_name = geo
-        nearby = find_nearby(lat, lng, 200)
-        base_url = os.getenv("BASE_URL", "").rstrip("/")
-        map_url = f"{base_url}/map?lat={lat}&lng={lng}"
-
-        if nearby:
-            reply_text = (
-                f"住所を座標に変換しました\n"
-                f"{address_name}\n"
-                f"件数: {len(nearby)}件\n"
-                f"{map_url}"
-            )
-        else:
-            reply_text = (
-                f"住所を座標に変換しました\n"
-                f"{address_name}\n"
-                f"200m以内に電柱が見つかりませんでした\n"
-                f"{map_url}"
-            )
+        reply_text = build_nearby_map_reply(
+            lat,
+            lng,
+            header=f"住所を座標に変換しました\n{address_name}"
+        )
     else:
         reply_text = span_reply
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+
+@handler.add(MessageEvent, message=LocationMessage)
+def handle_location(event):
+    lat = event.message.latitude
+    lng = event.message.longitude
+
+    title = event.message.title or "位置情報"
+    address = event.message.address or ""
+
+    header_lines = [title]
+    if address:
+        header_lines.append(address)
+
+    header = "\n".join(header_lines)
+    reply_text = build_nearby_map_reply(lat, lng, header=header)
 
     line_bot_api.reply_message(
         event.reply_token,
