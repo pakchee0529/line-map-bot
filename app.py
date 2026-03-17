@@ -1,9 +1,9 @@
-
-from flask import Flask, request, abort
+from flask import Flask, request, abort, render_template
 import json
 import os
 import unicodedata
 import re
+import math
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -19,6 +19,27 @@ handler = WebhookHandler(CHANNEL_SECRET)
 
 with open("coords.json", "r", encoding="utf-8") as f:
     coords = json.load(f)
+
+
+def load_gps():
+    with open("GPS.json", "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    points = []
+    for name, value in raw.items():
+        try:
+            lat_str, lng_str = str(value).split(",")
+            points.append({
+                "name": name,
+                "lat": float(lat_str),
+                "lng": float(lng_str),
+            })
+        except Exception:
+            pass
+    return points
+
+
+GPS_POINTS = load_gps()
 
 NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
 RANGE_PATTERN = re.compile(r"[～~]")
@@ -45,7 +66,6 @@ def split_input_lines(text: str):
 
 
 def make_display_name(text: str) -> str:
-    # 表示用径間名はスペース削除のみ、～以降は削除しない
     return remove_spaces(normalize_text(text))
 
 
@@ -57,13 +77,45 @@ def google_maps_url(latlon: str) -> str:
     return f"https://www.google.com/maps?q={latlon}"
 
 
+def parse_latlng(text: str):
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
+    if not m:
+        return None
+
+    lat = float(m.group(1))
+    lng = float(m.group(2))
+
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None
+
+    return lat, lng
+
+
+def distance_m(lat1, lng1, lat2, lng2):
+    r = 6371000
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlng / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def find_nearby(lat, lng, radius=200):
+    result = []
+    for p in GPS_POINTS:
+        d = distance_m(lat, lng, p["lat"], p["lng"])
+        if d <= radius:
+            item = dict(p)
+            item["distance"] = d
+            result.append(item)
+
+    result.sort(key=lambda x: x["distance"])
+    return result
+
+
 def parse_pole_name(name: str):
-    """
-    例:
-      葛川25 -> place=葛川, parent=25, branches=[]
-      那智合12N1G1 -> place=那智合, parent=12, branches=[('N',1),('G',1)]
-      大日川1N9E1G1 -> place=大日川, parent=1, branches=[('N',9),('E',1),('G',1)]
-    """
     m = POLE_PATTERN.match(name)
     if not m:
         return None
@@ -91,12 +143,6 @@ def build_pole_name(place: str, parent: int, branches):
 
 
 def is_hazard_g9_candidate(place: str, parent: int, prefix_branches=None) -> bool:
-    """
-    G9危険地帯特例が使えるか判定する
-    条件:
-      - 同一親番号・同一階層の G9 が存在
-      - 同一親番号・同一階層の G8 / G10 が存在しない
-    """
     if prefix_branches is None:
         prefix_branches = []
 
@@ -118,25 +164,14 @@ def hazard_g9_name(place: str, parent: int, prefix_branches=None):
 
 
 def complete_back_key(front_raw: str, back_raw: str):
-    """
-    前側と後側から後側キーを補完する
-
-    例:
-      葛川25～26 -> 葛川26
-      葛川17W2～17W3 -> 葛川17W3
-      那智合12N1G1～12N2 -> 那智合12N2
-      大日川1N9E1G1～E1G2 -> 大日川1N9E1G2
-    """
     front = parse_pole_name(front_raw)
     if not front:
         return None
 
-    # 完全な電柱名ならそのまま
     back_full = parse_pole_name(back_raw)
     if back_full and back_full["place"]:
         return build_pole_name(back_full["place"], back_full["parent"], back_full["branches"])
 
-    # 数字始まり: 26 / 17W3 / 12N2
     m_num = re.match(r"^(\d+)((?:[WNESG]\d+)*)$", back_raw)
     if m_num:
         parent = int(m_num.group(1))
@@ -144,7 +179,6 @@ def complete_back_key(front_raw: str, back_raw: str):
         branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", branch_str)]
         return build_pole_name(front["place"], parent, branches)
 
-    # 枝だけ: E1G2 のようなケース
     m_branch_only = re.match(r"^((?:[WNESG]\d+)+)$", back_raw)
     if m_branch_only:
         back_branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", back_raw)]
@@ -167,7 +201,6 @@ def complete_back_key(front_raw: str, back_raw: str):
         if matched_index is not None:
             prefix = front_branches[:matched_index]
         else:
-            # 同じ枝記号・番号が無ければ前側階層をそのまま前置
             prefix = front_branches
 
         return build_pole_name(front["place"], front["parent"], prefix + back_branches)
@@ -176,14 +209,6 @@ def complete_back_key(front_raw: str, back_raw: str):
 
 
 def create_search_keys(line: str):
-    """
-    戻り値:
-      display_name
-      is_range
-      hikikomi
-      front_key
-      back_key
-    """
     display_name = make_display_name(line)
     hikikomi = has_hikikomi(display_name)
 
@@ -220,10 +245,6 @@ def exact_match(name: str):
 
 
 def branch_neighbors(name: str):
-    """
-    末尾枝近傍探索
-    +1, -1, +2, -2, +3, -3
-    """
     parsed = parse_pole_name(name)
     if not parsed or not parsed["branches"]:
         return []
@@ -243,11 +264,6 @@ def branch_neighbors(name: str):
 
 
 def branch_reduction(name: str):
-    """
-    枝削減
-    例:
-      那智合12N1G1 -> 那智合12N1 -> 那智合12
-    """
     parsed = parse_pole_name(name)
     if not parsed or not parsed["branches"]:
         return []
@@ -263,11 +279,6 @@ def branch_reduction(name: str):
 
 
 def sibling_branch_search(name: str):
-    """
-    同階層枝探索
-    例:
-      葛川25W1 -> 葛川25W2, 葛川25W3...
-    """
     parsed = parse_pole_name(name)
     if not parsed or not parsed["branches"]:
         return []
@@ -286,24 +297,6 @@ def sibling_branch_search(name: str):
 
 
 def parent_only_candidates(name: str):
-    """
-    親番号のみ入力時の探索順
-
-    例:
-      葛川25
-      ↓
-      葛川25
-      ↓
-      葛川25G9（ただし 葛川25G8 / 葛川25G10 が無い場合のみ）
-      ↓
-      葛川26, 葛川24
-      ↓
-      葛川25W1, 葛川25E1, 葛川25N1, 葛川25S1, 葛川25G1
-      ↓
-      葛川27, 葛川23
-      ↓
-      葛川28, 葛川22 ...
-    """
     parsed = parse_pole_name(name)
     if not parsed:
         return []
@@ -315,11 +308,9 @@ def parent_only_candidates(name: str):
     place = parsed["place"]
     parent = parsed["parent"]
 
-    # 1) 危険地帯G9特例
     if is_hazard_g9_candidate(place, parent):
         result.append(hazard_g9_name(place, parent))
 
-    # 2) 前後番号 → 同番号枝 → さらに前後
     for d in range(1, 6):
         plus_name = build_pole_name(place, parent + d, [])
         minus_name = build_pole_name(place, parent - d, []) if parent - d > 0 else None
@@ -342,13 +333,6 @@ def parent_only_candidates(name: str):
 
 
 def non_parent_general_candidates(name: str):
-    """
-    親番号のみ以外の探索順
-    1 完全一致
-    2 末尾枝近傍探索
-    3 枝削減
-    4 同階層枝探索
-    """
     parsed = parse_pole_name(name)
     if not parsed:
         return [name]
@@ -389,8 +373,6 @@ def general_search_order(name: str):
                 seen.add(x)
                 result.append(x)
 
-        # 親番号のみは
-        # 完全一致 → G9特例 → 前後番号 → 枝 → さらに前後...
         add(name)
         for x in parent_only_candidates(name):
             add(x)
@@ -417,12 +399,6 @@ def resolve_one(line: str):
     adopted = None
     preferred_key = None
 
-    # 径間探索優先順位
-    # ① 後側完全一致
-    # ② 前側完全一致
-    # ③ 後側近傍探索
-    # ④ 前側近傍探索
-    # 引込/引き込みは前側のみ
     if is_range and back_key and not hikikomi:
         if exact_match(back_key):
             adopted = back_key
@@ -487,6 +463,24 @@ def resolve_message(text: str) -> str:
     return "\n\n".join(blocks)
 
 
+@app.route("/map")
+def map_view():
+    lat = request.args.get("lat", type=float)
+    lng = request.args.get("lng", type=float)
+
+    if lat is None or lng is None:
+        return "invalid lat/lng", 400
+
+    nearby = find_nearby(lat, lng, 200)
+
+    return render_template(
+        "map.html",
+        lat=lat,
+        lng=lng,
+        nearby=nearby
+    )
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -502,8 +496,22 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
-    user_text = event.message.text
-    reply_text = resolve_message(user_text)
+    user_text = event.message.text.strip()
+
+    parsed = parse_latlng(user_text)
+
+    if parsed:
+        lat, lng = parsed
+        nearby = find_nearby(lat, lng, 200)
+        base_url = os.getenv("BASE_URL", "").rstrip("/")
+        map_url = f"{base_url}/map?lat={lat}&lng={lng}"
+
+        if nearby:
+            reply_text = f"周辺200mの電柱地図です\n件数: {len(nearby)}件\n{map_url}"
+        else:
+            reply_text = f"200m以内に電柱が見つかりませんでした\n{map_url}"
+    else:
+        reply_text = resolve_message(user_text)
 
     line_bot_api.reply_message(
         event.reply_token,
