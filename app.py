@@ -372,26 +372,29 @@ def parent_only_candidates(name: str):
     place = parsed["place"]
     parent = parsed["parent"]
 
+    # 完全一致(name)の直後に、危険箇所扱いの G9 候補を差し込む
     if is_hazard_g9_candidate(place, parent):
         result.append(hazard_g9_name(place, parent))
 
-    for d in range(1, 6):
+    plus_1 = build_pole_name(place, parent + 1, [])
+    minus_1 = build_pole_name(place, parent - 1, []) if parent - 1 > 0 else None
+
+    if plus_1:
+        result.append(plus_1)
+    if minus_1:
+        result.append(minus_1)
+
+    for letter in ["W", "E", "N", "S", "G"]:
+        result.append(build_pole_name(place, parent, [(letter, 1)]))
+
+    for d in range(2, 6):
         plus_name = build_pole_name(place, parent + d, [])
         minus_name = build_pole_name(place, parent - d, []) if parent - d > 0 else None
 
-        if d == 1:
-            if plus_name:
-                result.append(plus_name)
-            if minus_name:
-                result.append(minus_name)
-
-            for letter in ["W", "E", "N", "S", "G"]:
-                result.append(build_pole_name(place, parent, [(letter, 1)]))
-        else:
-            if plus_name:
-                result.append(plus_name)
-            if minus_name:
-                result.append(minus_name)
+        if plus_name:
+            result.append(plus_name)
+        if minus_name:
+            result.append(minus_name)
 
     return result
 
