@@ -6,10 +6,17 @@ import re
 import math
 import urllib.parse
 import urllib.request
-import urllib.error
+import threading
+import time
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, LocationMessage
+from linebot.models import (
+    MessageEvent,
+    TextMessage,
+    TextSendMessage,
+    LocationMessage,
+    FollowEvent,
+)
 from linebot.exceptions import InvalidSignatureError
 
 app = Flask(__name__)
@@ -20,35 +27,168 @@ CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-with open("coords.json", "r", encoding="utf-8") as f:
-    coords = json.load(f)
 
-
-def load_gps():
+# ----------------------------
+# Data
+# ----------------------------
+def load_pole_coords():
     with open("GPS.json", "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    points = []
+    pole_coords = {}
+    gps_points = []
+
     for name, value in raw.items():
         try:
             lat_str, lng_str = str(value).split(",")
-            points.append({
+            lat = float(lat_str)
+            lng = float(lng_str)
+            latlon = f"{lat_str.strip()},{lng_str.strip()}"
+
+            pole_coords[name] = latlon
+            gps_points.append({
                 "name": name,
-                "lat": float(lat_str),
-                "lng": float(lng_str),
+                "lat": lat,
+                "lng": lng,
             })
         except Exception:
             pass
-    return points
+
+    return pole_coords, gps_points
 
 
-GPS_POINTS = load_gps()
+POLE_COORDS, GPS_POINTS = load_pole_coords()
 
+
+# ----------------------------
+# Constants / patterns
+# ----------------------------
 NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
 RANGE_PATTERN = re.compile(r"[～~]")
 POLE_PATTERN = re.compile(r"^(.*?)(\d+)((?:[WNESG]\d+)*)$")
 
 
+# ----------------------------
+# Messages
+# ----------------------------
+MSG_FRIEND = """はじめまして、電柱ナビのいっぱつちゃんだよ
+電柱名や径間名を送ると、その場所を地図で案内できるよ📍
+
+▼使い方
+そのまま送ればOK
+葛川25～26 / 谷垣内22
+複数まとめて送っても大丈夫👌
+
+電柱を1本だけ送ったときは
+その場所と、周辺200mの電柱地図も一緒に出すよ
+
+座標（緯度,経度）や、LINEの「＋」から位置情報を送ると
+近くの電柱をまとめて確認できるよ🗺️
+
+※ちょっとだけお願い
+地図を確認しながら探してるから、少し時間がかかることがあるよ
+見つけたらちゃんと案内するから、そのまま待っててね✨"""
+
+MSG_WAIT = """今探してるよ
+少し待っててね🔎"""
+
+
+# ----------------------------
+# Formatting helpers
+# ----------------------------
+def format_single_result(display_name: str, url: str, map_url: str | None, note: str | None = None) -> str:
+    lines = [
+        display_name,
+        "見つかったよ📍",
+        "この電柱の場所はここ",
+        url,
+    ]
+
+    if map_url:
+        lines.extend([
+            "",
+            "近くの電柱も一緒に確認できるよ",
+            "（半径200mの地図）",
+            map_url,
+        ])
+
+    if note:
+        lines.extend([
+            "",
+            "ぴったりの候補がなかったから",
+            "近い候補で案内してるよ",
+            note,
+        ])
+
+    return "\n".join(lines)
+
+
+def format_span_result(display_name: str, url: str, note: str | None = None) -> str:
+    lines = [
+        display_name,
+        "見つかったよ📍",
+        "この径間の場所はここ",
+        url,
+    ]
+
+    if note:
+        lines.extend([
+            "",
+            "ぴったりの候補がなかったから",
+            "近い候補で案内してるよ",
+            note,
+        ])
+
+    return "\n".join(lines)
+
+
+def format_not_found(display_name: str) -> str:
+    return f"""{display_name}
+ごめんね
+今回は見つからなかったよ💦
+
+地名や番号を少し変えると見つかるかも"""
+
+
+def format_location_result(map_url: str, count: int, header: str | None = None) -> str:
+    lines = []
+    if header:
+        lines.append(header)
+
+    lines.extend([
+        "この場所のまわりを確認したよ",
+        "半径200mの電柱地図はこれ🗺️",
+        f"件数: {count}件",
+        map_url,
+    ])
+    return "\n".join(lines)
+
+
+def format_location_empty(map_url: str, header: str | None = None) -> str:
+    lines = []
+    if header:
+        lines.append(header)
+
+    lines.extend([
+        "この場所のまわりを確認したよ",
+        "でも200m以内に電柱は見つからなかったよ💦",
+        "",
+        "地図はここから見れるよ🗺️",
+        map_url,
+    ])
+    return "\n".join(lines)
+
+
+def format_address_result(address_name: str, map_url: str) -> str:
+    return f"""場所を見つけたよ📍
+この周辺の電柱地図はこれ🗺️
+{address_name}
+{map_url}"""
+
+
+# ----------------------------
+# Basic text helpers
+# ----------------------------
 def normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.upper()
@@ -94,6 +234,9 @@ def parse_latlng(text: str):
     return lat, lng
 
 
+# ----------------------------
+# Nearby search
+# ----------------------------
 def distance_m(lat1, lng1, lat2, lng2):
     r = 6371000
     p1 = math.radians(lat1)
@@ -131,18 +274,18 @@ def geocode_address(address: str):
 
     req = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": "line-map-bot/1.0 (LINE bot pole map)"
-        }
+        headers={"User-Agent": "line-map-bot/1.0 (LINE bot pole map)"}
     )
 
     try:
         with urllib.request.urlopen(req, timeout=10) as res:
             data = json.loads(res.read().decode("utf-8"))
-    except Exception:
+    except Exception as e:
+        print(f"[geocode_address] request failed: {e}")
         return None
 
     if not data:
+        print("[geocode_address] no result")
         return None
 
     try:
@@ -151,7 +294,8 @@ def geocode_address(address: str):
         lng = float(item["lon"])
         display_name = item.get("display_name", address)
         return lat, lng, display_name
-    except Exception:
+    except Exception as e:
+        print(f"[geocode_address] parse failed: {e}")
         return None
 
 
@@ -160,25 +304,9 @@ def build_map_url(lat, lng):
     return f"{base_url}/map?lat={lat}&lng={lng}"
 
 
-def build_nearby_map_reply(lat, lng, header=None):
-    nearby = find_nearby(lat, lng, 200)
-    map_url = build_map_url(lat, lng)
-
-    lines = []
-    if header:
-        lines.append(header)
-
-    if nearby:
-        lines.append("周辺200mの電柱地図です")
-        lines.append(f"件数: {len(nearby)}件")
-        lines.append(map_url)
-    else:
-        lines.append("200m以内に電柱が見つかりませんでした")
-        lines.append(map_url)
-
-    return "\n".join(lines)
-
-
+# ----------------------------
+# Pole parsing / search logic
+# ----------------------------
 def parse_pole_name(name: str):
     m = POLE_PATTERN.match(name)
     if not m:
@@ -214,9 +342,9 @@ def is_hazard_g9_candidate(place: str, parent: int, prefix_branches=None) -> boo
     g8 = build_pole_name(place, parent, prefix_branches + [("G", 8)])
     g10 = build_pole_name(place, parent, prefix_branches + [("G", 10)])
 
-    if g9 not in coords:
+    if g9 not in POLE_COORDS:
         return False
-    if g8 in coords or g10 in coords:
+    if g8 in POLE_COORDS or g10 in POLE_COORDS:
         return False
     return True
 
@@ -303,7 +431,7 @@ def create_search_keys(line: str):
 
 
 def exact_match(name: str):
-    if name and name in coords:
+    if name and name in POLE_COORDS:
         return name
     return None
 
@@ -450,7 +578,7 @@ def general_search_order(name: str):
 
 def find_first_existing(candidates):
     for c in candidates:
-        if c in coords:
+        if c in POLE_COORDS:
             return c
     return None
 
@@ -490,49 +618,77 @@ def resolve_one(line: str):
             "found": False,
             "display_name": display_name,
             "url": None,
-            "note": None
+            "note": None,
+            "is_range": is_range,
+            "map_url": None,
+            "adopted": None,
         }
 
-    url = google_maps_url(coords[adopted])
+    latlon = POLE_COORDS[adopted]
+    url = google_maps_url(latlon)
     note = None
+    map_url = None
 
     if adopted != preferred_key:
         note = f"（{display_name} → {adopted}）"
+
+    if not is_range:
+        parsed = parse_latlng(latlon)
+        if parsed:
+            map_url = build_map_url(parsed[0], parsed[1])
 
     return {
         "found": True,
         "display_name": display_name,
         "url": url,
-        "note": note
+        "note": note,
+        "is_range": is_range,
+        "map_url": map_url,
+        "adopted": adopted,
     }
 
 
-def resolve_message(text: str) -> str:
+def resolve_lines(text: str):
     lines = split_input_lines(text)
+    results = []
 
-    if not lines:
+    for line in lines:
+        results.append(resolve_one(line))
+
+    return results
+
+
+def format_resolve_results(results):
+    if not results:
         return "入力が空です"
 
     blocks = []
 
-    for line in lines:
-        r = resolve_one(line)
-
+    for r in results:
         if r["found"]:
-            block = f"{r['display_name']}\n{r['url']}"
-            if r["note"]:
-                block += f"\n{r['note']}"
+            if r["is_range"]:
+                block = format_span_result(r["display_name"], r["url"], r["note"])
+            else:
+                block = format_single_result(r["display_name"], r["url"], r["map_url"], r["note"])
         else:
-            block = f"{r['display_name']}\n該当なし"
+            block = format_not_found(r["display_name"])
 
         blocks.append(block)
 
     return "\n\n".join(blocks)
 
 
+# ----------------------------
+# Routes
+# ----------------------------
 @app.route("/")
 def index():
     return "LINE pole map bot is running."
+
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
 
 
 @app.route("/map")
@@ -566,38 +722,83 @@ def callback():
     return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text(event):
-    user_text = event.message.text.strip()
+# ----------------------------
+# LINE event helpers
+# ----------------------------
+def push_if_possible(to_id: str | None, text: str):
+    if not to_id:
+        return
+    try:
+        line_bot_api.push_message(to_id, TextSendMessage(text=text))
+    except Exception as e:
+        print(f"[push_if_possible] failed: {e}")
 
+
+def process_text_logic(user_text: str) -> str:
     parsed = parse_latlng(user_text)
     if parsed:
         lat, lng = parsed
-        reply_text = build_nearby_map_reply(lat, lng)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_text)
-        )
-        return
+        nearby = find_nearby(lat, lng, 200)
+        map_url = build_map_url(lat, lng)
+        if nearby:
+            return format_location_result(map_url, len(nearby))
+        return format_location_empty(map_url)
 
-    span_reply = resolve_message(user_text)
-    if "該当なし" not in span_reply:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=span_reply)
-        )
-        return
+    lines = split_input_lines(user_text)
+    if not lines:
+        return "入力が空です"
+
+    # 複数行入力は検索専用として扱い、住所ジオコーディングには流さない
+    if len(lines) >= 2:
+        results = resolve_lines(user_text)
+        return format_resolve_results(results)
+
+    # 1行入力なら電柱検索 → ダメなら住所検索へ
+    results = resolve_lines(user_text)
+    if results and results[0]["found"]:
+        return format_resolve_results(results)
 
     geo = geocode_address(user_text)
     if geo:
         lat, lng, address_name = geo
-        reply_text = build_nearby_map_reply(
-            lat,
-            lng,
-            header=f"住所を座標に変換しました\n{address_name}"
+        map_url = build_map_url(lat, lng)
+        return format_address_result(address_name, map_url)
+
+    return format_resolve_results(results)
+
+
+# ----------------------------
+# LINE handlers
+# ----------------------------
+@handler.add(FollowEvent)
+def handle_follow(event):
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=MSG_FRIEND)
         )
-    else:
-        reply_text = span_reply
+    except Exception as e:
+        print(f"[handle_follow] failed: {e}")
+
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text(event):
+    user_text = event.message.text.strip()
+    user_id = getattr(event.source, "user_id", None)
+
+    done = {"flag": False}
+
+    def delayed_notice():
+        time.sleep(0.5)
+        if not done["flag"]:
+            push_if_possible(user_id, MSG_WAIT)
+
+    threading.Thread(target=delayed_notice, daemon=True).start()
+
+    try:
+        reply_text = process_text_logic(user_text)
+    finally:
+        done["flag"] = True
 
     line_bot_api.reply_message(
         event.reply_token,
@@ -618,7 +819,14 @@ def handle_location(event):
         header_lines.append(address)
 
     header = "\n".join(header_lines)
-    reply_text = build_nearby_map_reply(lat, lng, header=header)
+
+    nearby = find_nearby(lat, lng, 200)
+    map_url = build_map_url(lat, lng)
+
+    if nearby:
+        reply_text = format_location_result(map_url, len(nearby), header=header)
+    else:
+        reply_text = format_location_empty(map_url, header=header)
 
     line_bot_api.reply_message(
         event.reply_token,
