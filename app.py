@@ -789,7 +789,7 @@ def handle_text(event):
     done = {"flag": False}
 
     def delayed_notice():
-        time.sleep(0.5)
+        time.sleep(3)
         if not done["flag"]:
             push_if_possible(user_id, MSG_WAIT)
 
