@@ -35,11 +35,13 @@ handler = WebhookHandler(CHANNEL_SECRET)
 # ----------------------------
 BRANCH_LETTERS = "WNESGK"
 
+
 def normalize_key(text: str) -> str:
     text = unicodedata.normalize("NFKC", str(text))
     text = text.upper()
     text = re.sub(r"[ \u3000]+", "", text)
     return text
+
 
 def load_pole_coords():
     with open("GPS.json", "r", encoding="utf-8") as f:
@@ -59,8 +61,8 @@ def load_pole_coords():
 
             pole_coords[name] = latlon
             gps_points.append({
-                "name": raw_name,         # 表示用に元名を残す
-                "search_name": name,      # 必要なら検索用も持たせる
+                "name": raw_name,
+                "search_name": name,
                 "lat": lat,
                 "lng": lng,
             })
@@ -72,14 +74,12 @@ def load_pole_coords():
 
 POLE_COORDS, GPS_POINTS = load_pole_coords()
 
-
 # ----------------------------
 # Constants / patterns
 # ----------------------------
 NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
 RANGE_PATTERN = re.compile(r"[～~]")
 POLE_PATTERN = re.compile(rf"^(.*?)(\d+)((?:[{BRANCH_LETTERS}]\d+)*)$")
-
 
 # ----------------------------
 # Messages
@@ -105,11 +105,10 @@ MSG_FRIEND = """はじめまして、電柱ナビのいっぱつちゃんだよ
 MSG_WAIT = """今探してるよ
 少し待っててね🔎"""
 
-
 # ----------------------------
 # Formatting helpers
 # ----------------------------
-def format_single_result(display_name: str, url: str, map_url: str | None, note: str | None = None) -> str:
+def format_single_result(display_name: str, url: str, map_url=None, note=None) -> str:
     lines = [
         display_name,
         "見つかったよ📍",
@@ -136,7 +135,7 @@ def format_single_result(display_name: str, url: str, map_url: str | None, note:
     return "\n".join(lines)
 
 
-def format_span_result(display_name: str, url: str, note: str | None = None) -> str:
+def format_span_result(display_name: str, url: str, note=None) -> str:
     lines = [
         display_name,
         "見つかったよ📍",
@@ -163,7 +162,7 @@ def format_not_found(display_name: str) -> str:
 地名や番号を少し変えると見つかるかも"""
 
 
-def format_location_result(map_url: str, count: int, header: str | None = None) -> str:
+def format_location_result(map_url: str, count: int, header=None) -> str:
     lines = []
     if header:
         lines.append(header)
@@ -177,7 +176,7 @@ def format_location_result(map_url: str, count: int, header: str | None = None) 
     return "\n".join(lines)
 
 
-def format_location_empty(map_url: str, header: str | None = None) -> str:
+def format_location_empty(map_url: str, header=None) -> str:
     lines = []
     if header:
         lines.append(header)
@@ -197,7 +196,6 @@ def format_address_result(address_name: str, map_url: str) -> str:
 この周辺の電柱地図はこれ🗺️
 {address_name}
 {map_url}"""
-
 
 # ----------------------------
 # Basic text helpers
@@ -245,7 +243,6 @@ def parse_latlng(text: str):
         return None
 
     return lat, lng
-
 
 # ----------------------------
 # Nearby search
@@ -316,6 +313,7 @@ def build_map_url(lat, lng):
     base_url = os.getenv("BASE_URL", "").rstrip("/")
     return f"{base_url}/map?lat={lat}&lng={lng}"
 
+
 def build_multi_map_url(points):
     base_url = os.getenv("BASE_URL", "").rstrip("/")
 
@@ -329,6 +327,7 @@ def build_multi_map_url(points):
 
     encoded = urllib.parse.quote(json.dumps(payload, ensure_ascii=False))
     return f"{base_url}/multi-map?points={encoded}"
+
 
 def extract_found_points(results):
     points = []
@@ -357,6 +356,7 @@ def extract_found_points(results):
         })
 
     return points
+
 # ----------------------------
 # Pole parsing / search logic
 # ----------------------------
@@ -370,7 +370,7 @@ def parse_pole_name(name: str):
     branch_str = m.group(3)
 
     branches = []
-    for letter, num in re.findall(r"([WNESG])(\d+)", branch_str):
+    for letter, num in re.findall(rf"([{BRANCH_LETTERS}])(\d+)", branch_str):
         branches.append((letter, int(num)))
 
     return {
@@ -424,7 +424,7 @@ def complete_back_key(front_raw: str, back_raw: str):
         branches = [(l, int(n)) for l, n in re.findall(rf"([{BRANCH_LETTERS}])(\d+)", branch_str)]
         return build_pole_name(front["place"], parent, branches)
 
-    m_branch_only = re.match(r"^((?:[WNESG]\d+)+)$", back_raw)
+    m_branch_only = re.match(rf"^((?:[{BRANCH_LETTERS}]\d+)+)$", back_raw)
     if m_branch_only:
         back_branches = [(l, int(n)) for l, n in re.findall(rf"([{BRANCH_LETTERS}])(\d+)", back_raw)]
         front_branches = front["branches"]
@@ -553,7 +553,6 @@ def parent_only_candidates(name: str):
     place = parsed["place"]
     parent = parsed["parent"]
 
-    # 完全一致(name)の直後に、危険箇所扱いの G9 候補を差し込む
     if is_hazard_g9_candidate(place, parent):
         result.append(hazard_g9_name(place, parent))
 
@@ -711,33 +710,6 @@ def resolve_lines(text: str):
     return results
 
 
-def format_resolve_results(results, include_single_map=True, multi_map_url=None):
-    if not results:
-        return "入力が空です"
-    # ←ここ追加
-    if len(results) >= 2:
-        return format_multi_line_results(results, multi_map_url=multi_map_url)
-
-    blocks = []
-
-    for r in results:
-        if r["found"]:
-            if r["is_range"]:
-                block = format_span_result(r["display_name"], r["url"], r["note"])
-            else:
-                map_url = r["map_url"] if include_single_map else None
-                block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
-        else:
-            block = format_not_found(r["display_name"])
-
-        blocks.append(block)
-
-    text = "\n\n".join(blocks)
-
-    if multi_map_url:
-        text += f"\n\n複数の候補をまとめた地図はこちら🗺️\n{multi_map_url}"
-
-    return text
 def format_multi_line_results(results, multi_map_url=None):
     found_results = [r for r in results if r["found"]]
     not_found_results = [r for r in results if not r["found"]]
@@ -772,6 +744,36 @@ def format_multi_line_results(results, multi_map_url=None):
         lines.append(multi_map_url)
 
     return "\n".join(lines)
+
+
+def format_resolve_results(results, include_single_map=True, multi_map_url=None):
+    if not results:
+        return "入力が空です"
+
+    if len(results) >= 2:
+        return format_multi_line_results(results, multi_map_url=multi_map_url)
+
+    blocks = []
+
+    for r in results:
+        if r["found"]:
+            if r["is_range"]:
+                block = format_span_result(r["display_name"], r["url"], r["note"])
+            else:
+                map_url = r["map_url"] if include_single_map else None
+                block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
+        else:
+            block = format_not_found(r["display_name"])
+
+        blocks.append(block)
+
+    text = "\n\n".join(blocks)
+
+    if multi_map_url:
+        text += f"\n\n複数の候補をまとめた地図はこちら🗺️\n{multi_map_url}"
+
+    return text
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -787,7 +789,14 @@ def healthz():
 
 @app.route("/map")
 def map_view():
-    ...
+    lat = request.args.get("lat", type=float)
+    lng = request.args.get("lng", type=float)
+
+    if lat is None or lng is None:
+        return "invalid lat/lng", 400
+
+    nearby = find_nearby(lat, lng, 200)
+
     return render_template(
         "map.html",
         lat=lat,
@@ -845,11 +854,10 @@ def callback():
 
     return "OK"
 
-
 # ----------------------------
 # LINE event helpers
 # ----------------------------
-def push_if_possible(to_id: str | None, text: str):
+def push_if_possible(to_id=None, text=""):
     if not to_id:
         return
     try:
@@ -872,7 +880,6 @@ def process_text_logic(user_text: str) -> str:
     if not lines:
         return "入力が空です"
 
-       # 複数行入力は検索専用として扱い、住所ジオコーディングには流さない
     if len(lines) >= 2:
         results = resolve_lines(user_text)
         points = extract_found_points(results)
@@ -887,7 +894,6 @@ def process_text_logic(user_text: str) -> str:
             multi_map_url=multi_map_url
         )
 
-    # 1行入力なら電柱検索 → ダメなら住所検索へ
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
         return format_resolve_results(results)
@@ -899,7 +905,6 @@ def process_text_logic(user_text: str) -> str:
         return format_address_result(address_name, map_url)
 
     return format_resolve_results(results)
-
 
 # ----------------------------
 # LINE handlers
