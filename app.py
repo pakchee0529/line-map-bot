@@ -33,6 +33,14 @@ handler = WebhookHandler(CHANNEL_SECRET)
 # ----------------------------
 # Data
 # ----------------------------
+BRANCH_LETTERS = "WNESGK"
+
+def normalize_key(text: str) -> str:
+    text = unicodedata.normalize("NFKC", str(text))
+    text = text.upper()
+    text = re.sub(r"[ \u3000]+", "", text)
+    return text
+
 def load_pole_coords():
     with open("GPS.json", "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -40,16 +48,19 @@ def load_pole_coords():
     pole_coords = {}
     gps_points = []
 
-    for name, value in raw.items():
+    for raw_name, value in raw.items():
         try:
             lat_str, lng_str = str(value).split(",")
             lat = float(lat_str)
             lng = float(lng_str)
             latlon = f"{lat_str.strip()},{lng_str.strip()}"
 
+            name = normalize_key(raw_name)
+
             pole_coords[name] = latlon
             gps_points.append({
-                "name": name,
+                "name": raw_name,         # 表示用に元名を残す
+                "search_name": name,      # 必要なら検索用も持たせる
                 "lat": lat,
                 "lng": lng,
             })
@@ -67,7 +78,7 @@ POLE_COORDS, GPS_POINTS = load_pole_coords()
 # ----------------------------
 NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
 RANGE_PATTERN = re.compile(r"[～~]")
-POLE_PATTERN = re.compile(r"^(.*?)(\d+)((?:[WNESG]\d+)*)$")
+POLE_PATTERN = re.compile(rf"^(.*?)(\d+)((?:[{BRANCH_LETTERS}]\d+)*)$")
 
 
 # ----------------------------
@@ -366,16 +377,16 @@ def complete_back_key(front_raw: str, back_raw: str):
     if back_full and back_full["place"]:
         return build_pole_name(back_full["place"], back_full["parent"], back_full["branches"])
 
-    m_num = re.match(r"^(\d+)((?:[WNESG]\d+)*)$", back_raw)
+    m_num = re.match(rf"^(\d+)((?:[{BRANCH_LETTERS}]\d+)*)$", back_raw)
     if m_num:
         parent = int(m_num.group(1))
         branch_str = m_num.group(2)
-        branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", branch_str)]
+        branches = [(l, int(n)) for l, n in re.findall(rf"([{BRANCH_LETTERS}])(\d+)", branch_str)]
         return build_pole_name(front["place"], parent, branches)
 
     m_branch_only = re.match(r"^((?:[WNESG]\d+)+)$", back_raw)
     if m_branch_only:
-        back_branches = [(l, int(n)) for l, n in re.findall(r"([WNESG])(\d+)", back_raw)]
+        back_branches = [(l, int(n)) for l, n in re.findall(rf"([{BRANCH_LETTERS}])(\d+)", back_raw)]
         front_branches = front["branches"]
 
         if not back_branches:
@@ -514,7 +525,7 @@ def parent_only_candidates(name: str):
     if minus_1:
         result.append(minus_1)
 
-    for letter in ["W", "E", "N", "S", "G"]:
+    for letter in ["W", "E", "N", "S", "G", "K"]:
         result.append(build_pole_name(place, parent, [(letter, 1)]))
 
     for d in range(2, 6):
