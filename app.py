@@ -316,7 +316,47 @@ def build_map_url(lat, lng):
     base_url = os.getenv("BASE_URL", "").rstrip("/")
     return f"{base_url}/map?lat={lat}&lng={lng}"
 
+def build_multi_map_url(points):
+    base_url = os.getenv("BASE_URL", "").rstrip("/")
 
+    payload = []
+    for p in points:
+        payload.append({
+            "name": p["display_name"],
+            "lat": p["lat"],
+            "lng": p["lng"],
+        })
+
+    encoded = urllib.parse.quote(json.dumps(payload, ensure_ascii=False))
+    return f"{base_url}/multi-map?points={encoded}"
+
+def extract_found_points(results):
+    points = []
+
+    for r in results:
+        if not r["found"]:
+            continue
+
+        if not r["adopted"]:
+            continue
+
+        latlon = POLE_COORDS.get(r["adopted"])
+        if not latlon:
+            continue
+
+        parsed = parse_latlng(latlon)
+        if not parsed:
+            continue
+
+        lat, lng = parsed
+
+        points.append({
+            "display_name": r["display_name"],
+            "lat": lat,
+            "lng": lng,
+        })
+
+    return points
 # ----------------------------
 # Pole parsing / search logic
 # ----------------------------
@@ -671,7 +711,7 @@ def resolve_lines(text: str):
     return results
 
 
-def format_resolve_results(results, include_single_map=True):
+def format_resolve_results(results, include_single_map=True, multi_map_url=None):
     if not results:
         return "入力が空です"
 
@@ -689,8 +729,12 @@ def format_resolve_results(results, include_single_map=True):
 
         blocks.append(block)
 
-    return "\n\n".join(blocks)
+    text = "\n\n".join(blocks)
 
+    if multi_map_url:
+        text += f"\n\n複数の候補をまとめた地図はこちら🗺️\n{multi_map_url}"
+
+    return text
 
 # ----------------------------
 # Routes
@@ -707,20 +751,50 @@ def healthz():
 
 @app.route("/map")
 def map_view():
-    lat = request.args.get("lat", type=float)
-    lng = request.args.get("lng", type=float)
-
-    if lat is None or lng is None:
-        return "invalid lat/lng", 400
-
-    nearby = find_nearby(lat, lng, 200)
-
+    ...
     return render_template(
         "map.html",
         lat=lat,
         lng=lng,
         nearby=nearby
     )
+
+
+@app.route("/multi-map")
+def multi_map_view():
+    points_raw = request.args.get("points", "")
+
+    if not points_raw:
+        return "missing points", 400
+
+    try:
+        points = json.loads(points_raw)
+    except Exception:
+        try:
+            points = json.loads(urllib.parse.unquote(points_raw))
+        except Exception:
+            return "invalid points", 400
+
+    valid_points = []
+
+    for p in points:
+        try:
+            lat = float(p["lat"])
+            lng = float(p["lng"])
+            name = str(p.get("name", "電柱"))
+
+            valid_points.append({
+                "name": name,
+                "lat": lat,
+                "lng": lng,
+            })
+        except Exception:
+            pass
+
+    if not valid_points:
+        return "no valid points", 400
+
+    return render_template("multi_map.html", points=valid_points)
 
 
 @app.route("/callback", methods=["POST"])
@@ -762,11 +836,20 @@ def process_text_logic(user_text: str) -> str:
     if not lines:
         return "入力が空です"
 
-    # 複数行入力は検索専用として扱い、住所ジオコーディングには流さない
+       # 複数行入力は検索専用として扱い、住所ジオコーディングには流さない
     if len(lines) >= 2:
         results = resolve_lines(user_text)
-        if results and results[0]["found"]:
-            return format_resolve_results(results, include_single_map=False)
+        points = extract_found_points(results)
+
+        multi_map_url = None
+        if len(points) >= 2:
+            multi_map_url = build_multi_map_url(points)
+
+        return format_resolve_results(
+            results,
+            include_single_map=False,
+            multi_map_url=multi_map_url
+        )
 
     # 1行入力なら電柱検索 → ダメなら住所検索へ
     results = resolve_lines(user_text)
