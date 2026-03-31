@@ -671,7 +671,7 @@ def resolve_lines(text: str):
     return results
 
 
-def format_resolve_results(results):
+def format_resolve_results(results, include_single_map=True):
     if not results:
         return "入力が空です"
 
@@ -682,7 +682,8 @@ def format_resolve_results(results):
             if r["is_range"]:
                 block = format_span_result(r["display_name"], r["url"], r["note"])
             else:
-                block = format_single_result(r["display_name"], r["url"], r["map_url"], r["note"])
+                map_url = r["map_url"] if include_single_map else None
+                block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
         else:
             block = format_not_found(r["display_name"])
 
@@ -764,7 +765,8 @@ def process_text_logic(user_text: str) -> str:
     # 複数行入力は検索専用として扱い、住所ジオコーディングには流さない
     if len(lines) >= 2:
         results = resolve_lines(user_text)
-        return format_resolve_results(results)
+        if results and results[0]["found"]:
+            return format_resolve_results(results, include_single_map=False)
 
     # 1行入力なら電柱検索 → ダメなら住所検索へ
     results = resolve_lines(user_text)
