@@ -1,0 +1,13 @@
+{
+  "name": "line-pole-map-bot-complete",
+  "version": "1.0.0",
+  "description": "LINE bot for pole span lookup and nearby map",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^9.7.0",
+    "express": "^4.21.2"
+  }
+}

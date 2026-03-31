@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>周辺電柱マップ</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+
+    .info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1000;
+      background: rgba(255,255,255,.96);
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.2);
+      line-height: 1.4;
+    }
+
+    .leaflet-tooltip.pole-tooltip {
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      padding: 0;
+    }
+
+    .pole-label {
+      display: inline-block;
+      background: rgba(255,255,255,.92);
+      border: 1px solid #666;
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-size: 11px;
+      font-weight: bold;
+      color: #111;
+      white-space: nowrap;
+      box-shadow: 0 1px 3px rgba(0,0,0,.25);
+    }
+
+    .my-div-icon {
+      background: transparent;
+      border: none;
+    }
+
+    .pole-pin {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 2px solid #fff;
+      box-sizing: border-box;
+      box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+    }
+
+    .pole-pin.normal {
+      background: #2563eb;
+    }
+
+    .pole-pin.nearest {
+      width: 14px;
+      height: 14px;
+      background: #ef4444;
+      box-shadow: 0 0 0 1px rgba(0,0,0,.45), 0 0 6px rgba(239,68,68,.45);
+    }
+
+    .pole-pin.center {
+      width: 14px;
+      height: 14px;
+      background: #16a34a;
+      box-shadow: 0 0 0 1px rgba(0,0,0,.45), 0 0 6px rgba(22,163,74,.35);
+    }
+  </style>
+</head>
+<body>
+  <div class="info">
+    電柱: {{ nearby|length }}件<br>
+    緑: 現在地 / 赤: 最寄り / 青: その他
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const center = [{{ lat }}, {{ lng }}];
+    const nearby = {{ nearby | tojson }};
+
+    const map = L.map("map").setView(center, 18);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+
+    function createDotIcon(type) {
+      const size = (type === "nearest" || type === "center") ? 14 : 12;
+      const anchor = (type === "nearest" || type === "center") ? 7 : 6;
+
+      return L.divIcon({
+        className: "my-div-icon",
+        html: '<div class="pole-pin ' + type + '"></div>',
+        iconSize: [size, size],
+        iconAnchor: [anchor, anchor],
+        popupAnchor: [0, -8]
+      });
+    }
+
+    L.marker(center, { icon: createDotIcon("center") })
+      .addTo(map)
+      .bindPopup("現在地");
+
+    const nearestName = nearby.length ? nearby[0].name : null;
+
+    nearby.forEach((p) => {
+      const isNearest = p.name === nearestName;
+
+      L.marker([p.lat, p.lng], {
+        icon: createDotIcon(isNearest ? "nearest" : "normal")
+      })
+      .addTo(map)
+      .bindPopup(p.name + "<br>" + Math.round(p.distance) + "m")
+      .bindTooltip(
+        '<span class="pole-label">' + p.name + (isNearest ? " ★" : "") + '</span>',
+        {
+          permanent: true,
+          direction: "top",
+          offset: [0, -8],
+          className: "pole-tooltip"
+        }
+      );
+    });
+  </script>
+</body>
+</html>
