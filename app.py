@@ -714,6 +714,9 @@ def resolve_lines(text: str):
 def format_resolve_results(results, include_single_map=True, multi_map_url=None):
     if not results:
         return "入力が空です"
+    # ←ここ追加
+    if len(results) >= 2:
+        return format_multi_line_results(results, multi_map_url=multi_map_url)
 
     blocks = []
 
@@ -735,7 +738,40 @@ def format_resolve_results(results, include_single_map=True, multi_map_url=None)
         text += f"\n\n複数の候補をまとめた地図はこちら🗺️\n{multi_map_url}"
 
     return text
+def format_multi_line_results(results, multi_map_url=None):
+    found_results = [r for r in results if r["found"]]
+    not_found_results = [r for r in results if not r["found"]]
 
+    lines = []
+
+    if found_results:
+        lines.append(f"検索結果 {len(found_results)}件")
+        lines.append("")
+
+        for i, r in enumerate(found_results):
+            lines.append(r["display_name"])
+            lines.append(r["url"])
+
+            if r["note"]:
+                lines.append(f"{r['note']}")
+
+            if i != len(found_results) - 1:
+                lines.append("")
+
+    if not_found_results:
+        if lines:
+            lines.append("")
+        lines.append("見つからなかったもの")
+        for r in not_found_results:
+            lines.append(f"- {r['display_name']}")
+
+    if multi_map_url:
+        if lines:
+            lines.append("")
+        lines.append("複数の候補をまとめた地図はこちら🗺️")
+        lines.append(multi_map_url)
+
+    return "\n".join(lines)
 # ----------------------------
 # Routes
 # ----------------------------
