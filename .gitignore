@@ -8,6 +8,12 @@
 __pycache__/
 *.pyc
 
+# requirementsハッシュ（自動生成）
+.requirements_hash
+
 # OS系
 .DS_Store
 Thumbs.db
+
+# ログ
+*.log
