@@ -7,6 +7,9 @@ import math
 import urllib.parse
 import urllib.request
 import threading
+import uuid
+
+MAP_STORE = {}
 import time
 from dotenv import load_dotenv
 
@@ -325,8 +328,10 @@ def build_multi_map_url(points):
             "lng": p["lng"],
         })
 
-    encoded = urllib.parse.quote(json.dumps(payload, ensure_ascii=False))
-    return f"{base_url}/multi-map?points={encoded}"
+    map_id = str(uuid.uuid4())
+    MAP_STORE[map_id] = payload
+
+    return f"{base_url}/multi-map?id={map_id}"
 
 
 def extract_found_points(results):
@@ -807,18 +812,15 @@ def map_view():
 
 @app.route("/multi-map")
 def multi_map_view():
-    points_raw = request.args.get("points", "")
+    map_id = request.args.get("id")
 
-    if not points_raw:
-        return "missing points", 400
+    if not map_id:
+        return "missing id", 400
 
-    try:
-        points = json.loads(points_raw)
-    except Exception:
-        try:
-            points = json.loads(urllib.parse.unquote(points_raw))
-        except Exception:
-            return "invalid points", 400
+    points = MAP_STORE.get(map_id)
+
+    if not points:
+        return "data expired or not found", 404
 
     valid_points = []
 
