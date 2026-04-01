@@ -22,21 +22,35 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const points = {{ points|tojson }};
-
+  
     const map = L.map('map');
-
+  
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
-
+  
     const bounds = [];
-
+  
     points.forEach(p => {
       const marker = L.marker([p.lat, p.lng]).addTo(map);
-      marker.bindPopup(p.name);
+  
+      const googleUrl = `https://www.google.com/maps?q=${p.lat},${p.lng}`;
+      const popupHtml = `
+  <div>
+    <div>${p.name}</div>
+    <div style="margin-top: 6px;">
+      <a href="${googleUrl}" target="_blank" rel="noopener noreferrer"
+         onclick="return confirm('Googleマップで開きますか？');">
+        Googleマップで開く
+      </a>
+    </div>
+  </div>
+`;
+  
+      marker.bindPopup(popupHtml);
       bounds.push([p.lat, p.lng]);
     });
-
+  
     if (bounds.length === 1) {
       map.setView(bounds[0], 18);
     } else {
