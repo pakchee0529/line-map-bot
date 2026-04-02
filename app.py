@@ -8,6 +8,8 @@ import urllib.parse
 import urllib.request
 import threading
 import uuid
+import redis
+
 
 MAP_STORE = {}
 import time
@@ -32,6 +34,10 @@ CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
+
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+MULTI_MAP_TTL_SECONDS = 60 * 60 * 168
 
 # ----------------------------
 # Data
@@ -329,7 +335,16 @@ def build_multi_map_url(points):
         })
 
     map_id = str(uuid.uuid4())
-    MAP_STORE[map_id] = payload
+
+    if redis_client:
+        redis_client.set(
+            f"multi_map:{map_id}",
+            json.dumps(payload, ensure_ascii=False),
+            ex=MULTI_MAP_TTL_SECONDS,
+        )
+    else:
+        print("[build_multi_map_url] REDIS_URL is not set")
+        return None
 
     return f"{base_url}/multi-map?id={map_id}"
 
@@ -817,10 +832,18 @@ def multi_map_view():
     if not map_id:
         return "missing id", 400
 
-    points = MAP_STORE.get(map_id)
+    if not redis_client:
+        return "redis is not configured", 500
 
-    if not points:
+    raw = redis_client.get(f"multi_map:{map_id}")
+
+    if not raw:
         return "data expired or not found", 404
+
+    try:
+        points = json.loads(raw)
+    except Exception:
+        return "invalid stored data", 500
 
     valid_points = []
 
@@ -883,18 +906,18 @@ def process_text_logic(user_text: str) -> str:
         return "入力が空です"
 
     if len(lines) >= 2:
-        results = resolve_lines(user_text)
-        points = extract_found_points(results)
+    results = resolve_lines(user_text)
+    points = extract_found_points(results)
 
-        multi_map_url = None
-        if len(points) >= 2:
-            multi_map_url = build_multi_map_url(points)
+    multi_map_url = None
+    if len(points) >= 2:
+        multi_map_url = build_multi_map_url(points)
 
-        return format_resolve_results(
-            results,
-            include_single_map=False,
-            multi_map_url=multi_map_url
-        )
+    return format_resolve_results(
+        results,
+        include_single_map=False,
+        multi_map_url=multi_map_url
+    )
 
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
