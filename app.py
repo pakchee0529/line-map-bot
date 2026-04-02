@@ -9,9 +9,6 @@ import urllib.request
 import threading
 import uuid
 import redis
-
-
-MAP_STORE = {}
 import time
 from dotenv import load_dotenv
 
@@ -906,18 +903,18 @@ def process_text_logic(user_text: str) -> str:
         return "入力が空です"
 
     if len(lines) >= 2:
-    results = resolve_lines(user_text)
-    points = extract_found_points(results)
+        results = resolve_lines(user_text)
+        points = extract_found_points(results)
 
-    multi_map_url = None
-    if len(points) >= 2:
-        multi_map_url = build_multi_map_url(points)
+        multi_map_url = None
+        if len(points) >= 2:
+            multi_map_url = build_multi_map_url(points)
 
-    return format_resolve_results(
-        results,
-        include_single_map=False,
-        multi_map_url=multi_map_url
-    )
+        return format_resolve_results(
+            results,
+            include_single_map=False,
+            multi_map_url=multi_map_url
+        )
 
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
