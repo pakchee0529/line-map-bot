@@ -1,6 +1,6 @@
 from flask import Flask, request, abort, render_template
-import json
 import os
+import json
 import unicodedata
 import re
 import math
@@ -8,8 +8,11 @@ import urllib.parse
 import urllib.request
 import threading
 import uuid
-import redis
 import time
+import secrets
+from datetime import datetime, timezone, timedelta
+
+import redis
 from dotenv import load_dotenv
 
 from linebot import LineBotApi, WebhookHandler
@@ -26,29 +29,500 @@ app = Flask(__name__)
 
 load_dotenv()
 
+# ----------------------------
+# Env / Config
+# ----------------------------
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+REDIS_URL = os.getenv("REDIS_URL")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-REDIS_URL = os.getenv("REDIS_URL")
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-MULTI_MAP_TTL_SECONDS = 60 * 60 * 168
+
+MULTI_MAP_TTL_SECONDS = 60 * 60 * 24 * 7
+JST = timezone(timedelta(hours=9))
+BRANCH_LETTERS = "WNESGK"
+NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
+RANGE_PATTERN = re.compile(r"[～~]")
+POLE_PATTERN = re.compile(rf"^(.*?)(\d+)((?:[{BRANCH_LETTERS}]\d+)*)$")
+
+OPERATOR_USER_IDS = {
+    x.strip() for x in os.getenv("OPERATOR_USER_IDS", "").split(",") if x.strip()
+}
+
+# ----------------------------
+# Messages
+# ----------------------------
+MSG_FRIEND = """はじめまして、電柱ナビのいっぱつちゃんだよ
+電柱名や径間名を送ると、その場所を地図で案内できるよ📍
+
+▼使い方
+そのまま送ればOK
+葛川25～26 / 谷垣内22
+複数まとめて送っても大丈夫👌
+
+電柱を1本だけ送ったときは
+その場所と、周辺200mの電柱地図も一緒に出すよ
+
+座標（緯度,経度）や、LINEの「＋」から位置情報を送ると
+近くの電柱をまとめて確認できるよ🗺️"""
+
+MSG_WAIT = """今探してるよ
+少し待っててね🔎"""
+
+MSG_REGISTER_GUIDE = """このアカウントはまだ利用登録されてないよ
+会社管理者から招待コードをもらって、最初にこう送ってね
+
+参加 招待コード
+
+例
+ABCD1234"""
+
+MSG_ALREADY_REGISTERED = "このアカウントはもう登録済みだよ👌"
+
+MSG_JOIN_SUCCESS = """利用登録が完了したよ🎉
+これでいつも通り使えるようになったよ"""
+
+MSG_JOIN_FAILED_INVALID = """招待コードを確認できなかったよ💦
+英数字や空白の違いがないか見直してみてね"""
+
+MSG_JOIN_FAILED_LIMIT = """この会社の利用人数が上限に達しとるよ
+管理者に確認してみてね"""
+
+MSG_JOIN_FAILED_INACTIVE = """この招待コードは使えない状態みたい
+管理者に新しいコードを発行してもらってね"""
+
+MSG_ACCESS_DENIED = """このアカウントではまだ利用できないよ
+管理者から招待コードをもらって登録してね"""
+
+# ----------------------------
+# Common helpers
+# ----------------------------
+def now_iso():
+    return datetime.now(JST).isoformat()
+
+
+def parse_iso(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", str(text))
+    text = text.upper()
+    return text
+
+
+def remove_spaces(text: str) -> str:
+    return re.sub(r"[ \u3000]+", "", str(text))
+
+
+def normalize_key(text: str) -> str:
+    return remove_spaces(normalize_text(text))
+
+
+def normalize_input_line(text: str) -> str:
+    return remove_spaces(normalize_text(text.strip()))
+
+
+def split_input_lines(text: str):
+    lines = [normalize_input_line(line) for line in text.splitlines()]
+    return [line for line in lines if line]
+
+
+def make_display_name(text: str) -> str:
+    return remove_spaces(normalize_text(text))
+
+
+def has_hikikomi(text: str) -> bool:
+    return "引込" in text or "引き込み" in text
+
+
+def normalize_invite_code(code: str) -> str:
+    return remove_spaces(normalize_text(code or ""))
+
+
+def generate_invite_code(length=8):
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def google_maps_url(latlon: str) -> str:
+    return f"https://www.google.com/maps?q={latlon}"
+
+
+def parse_latlng(text: str):
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
+    if not m:
+        return None
+
+    lat = float(m.group(1))
+    lng = float(m.group(2))
+
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None
+
+    return lat, lng
+
+
+def is_operator(user_id: str) -> bool:
+    return bool(user_id) and user_id in OPERATOR_USER_IDS
+
+# ----------------------------
+# Redis JSON helpers
+# ----------------------------
+def redis_json_get(key):
+    if not redis_client:
+        return None
+
+    raw = redis_client.get(key)
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def redis_json_set(key, value):
+    if not redis_client:
+        return False
+
+    redis_client.set(key, json.dumps(value, ensure_ascii=False))
+    return True
+
+
+def get_company(company_id):
+    return redis_json_get(f"company:{company_id}")
+
+
+def save_company(company_data):
+    payload = dict(company_data)
+    now = now_iso()
+
+    if "created_at" not in payload:
+        payload["created_at"] = now
+    payload["updated_at"] = now
+
+    company_id = payload["company_id"]
+    return redis_json_set(f"company:{company_id}", payload)
+
+
+def get_user(user_id):
+    return redis_json_get(f"user:{user_id}")
+
+
+def save_user(user_data):
+    payload = dict(user_data)
+    now = now_iso()
+
+    if "created_at" not in payload:
+        payload["created_at"] = now
+    payload["updated_at"] = now
+
+    user_id = payload["user_id"]
+    return redis_json_set(f"user:{user_id}", payload)
+
+
+def get_invite(code):
+    return redis_json_get(f"invite:{code}")
+
+
+def save_invite(invite_data):
+    payload = dict(invite_data)
+    now = now_iso()
+
+    if "created_at" not in payload:
+        payload["created_at"] = now
+    payload["updated_at"] = now
+
+    code = payload["code"]
+    return redis_json_set(f"invite:{code}", payload)
+
+
+def add_user_to_company(company_id, user_id):
+    if not redis_client:
+        return 0
+    return redis_client.sadd(f"company_users:{company_id}", user_id)
+
+
+def remove_user_from_company(company_id, user_id):
+    if not redis_client:
+        return 0
+    return redis_client.srem(f"company_users:{company_id}", user_id)
+
+
+def count_company_users(company_id):
+    if not redis_client:
+        return 0
+    return redis_client.scard(f"company_users:{company_id}")
+
+
+def list_company_users(company_id):
+    if not redis_client:
+        return []
+    return sorted(redis_client.smembers(f"company_users:{company_id}"))
+
+
+def add_invite_to_company(company_id, code):
+    if not redis_client:
+        return 0
+    return redis_client.sadd(f"company_invites:{company_id}", code)
+
+
+def list_company_invite_codes(company_id):
+    if not redis_client:
+        return []
+    return sorted(redis_client.smembers(f"company_invites:{company_id}"))
+
+# ----------------------------
+# User management helpers
+# ----------------------------
+def is_company_active(company_data):
+    return bool(company_data) and company_data.get("status") == "active"
+
+
+def is_user_active(user_data):
+    return bool(user_data) and user_data.get("status") == "active"
+
+
+def is_invite_expired(invite_data):
+    expires_at = invite_data.get("expires_at")
+    if not expires_at:
+        return False
+
+    dt = parse_iso(expires_at)
+    if not dt:
+        return False
+
+    return datetime.now(JST) > dt
+
+
+def touch_user(user_data):
+    if not user_data:
+        return
+
+    payload = dict(user_data)
+    payload["last_seen_at"] = now_iso()
+    save_user(payload)
+
+
+def is_user_allowed(user_id):
+    if not user_id:
+        return False, "user_id_missing", None, None
+
+    user_data = get_user(user_id)
+    if not user_data:
+        return False, "user_not_registered", None, None
+
+    if not is_user_active(user_data):
+        return False, "user_disabled", user_data, None
+
+    company_id = user_data.get("company_id")
+    if not company_id:
+        return False, "company_missing", user_data, None
+
+    company_data = get_company(company_id)
+    if not company_data:
+        return False, "company_not_found", user_data, None
+
+    if not is_company_active(company_data):
+        return False, "company_inactive", user_data, company_data
+
+    return True, "ok", user_data, company_data
+
+
+def can_join_company(company_id):
+    company_data = get_company(company_id)
+    if not company_data:
+        return False, "company_not_found", None
+
+    if company_data.get("status") != "active":
+        return False, "company_inactive", company_data
+
+    user_limit = int(company_data.get("user_limit", 0) or 0)
+    current_count = count_company_users(company_id)
+
+    if user_limit > 0 and current_count >= user_limit:
+        return False, "user_limit_reached", company_data
+
+    return True, "ok", company_data
+
+
+def create_company(company_id, name, user_limit, plan="subcontractor_basic", note=""):
+    company_id = normalize_key(company_id)
+
+    if not company_id:
+        return False, "company_id_empty"
+
+    if get_company(company_id):
+        return False, "company_exists"
+
+    company_data = {
+        "company_id": company_id,
+        "name": name.strip(),
+        "status": "active",
+        "plan": plan,
+        "user_limit": int(user_limit),
+        "admin_user_ids": [],
+        "created_by": "operator",
+        "note": note,
+    }
+    save_company(company_data)
+    return True, company_id
+
+
+def add_admin_to_company(company_id, user_id):
+    company_data = get_company(company_id)
+    if not company_data:
+        return False, "company_not_found"
+
+    admin_ids = company_data.get("admin_user_ids", [])
+    if user_id not in admin_ids:
+        admin_ids.append(user_id)
+
+    company_data["admin_user_ids"] = admin_ids
+    save_company(company_data)
+    return True, "ok"
+
+
+def create_invite(company_id, created_by, role="member", max_uses=1, expires_days=7):
+    company_data = get_company(company_id)
+    if not company_data:
+        return False, "company_not_found", None
+
+    if company_data.get("status") != "active":
+        return False, "company_inactive", None
+
+    code = generate_invite_code()
+
+    expires_at = None
+    if expires_days:
+        expires_at = (datetime.now(JST) + timedelta(days=expires_days)).isoformat()
+
+    invite_data = {
+        "code": code,
+        "company_id": company_id,
+        "role": role,
+        "status": "active",
+        "created_by": created_by,
+        "max_uses": int(max_uses),
+        "used_count": 0,
+        "expires_at": expires_at,
+    }
+
+    save_invite(invite_data)
+    add_invite_to_company(company_id, code)
+    return True, "ok", invite_data
+
+
+def consume_invite(code):
+    invite_data = get_invite(code)
+    if not invite_data:
+        return False, "invite_not_found", None
+
+    if invite_data.get("status") != "active":
+        return False, "invite_inactive", invite_data
+
+    if is_invite_expired(invite_data):
+        invite_data["status"] = "expired"
+        save_invite(invite_data)
+        return False, "invite_expired", invite_data
+
+    max_uses = int(invite_data.get("max_uses", 1) or 1)
+    used_count = int(invite_data.get("used_count", 0) or 0)
+
+    if used_count >= max_uses:
+        invite_data["status"] = "used_up"
+        save_invite(invite_data)
+        return False, "invite_limit_reached", invite_data
+
+    invite_data["used_count"] = used_count + 1
+
+    if invite_data["used_count"] >= max_uses:
+        invite_data["status"] = "used_up"
+
+    save_invite(invite_data)
+    return True, "ok", invite_data
+
+
+def join_company_with_invite(user_id, code):
+    code = normalize_invite_code(code)
+    if not code:
+        return False, "invite_code_empty"
+
+    existing_user = get_user(user_id)
+    if existing_user and existing_user.get("status") == "active":
+        return False, "already_registered"
+
+    invite_data = get_invite(code)
+    if not invite_data:
+        return False, "invite_not_found"
+
+    if invite_data.get("status") != "active":
+        return False, "invite_inactive"
+
+    if is_invite_expired(invite_data):
+        invite_data["status"] = "expired"
+        save_invite(invite_data)
+        return False, "invite_expired"
+
+    company_id = invite_data.get("company_id")
+    role = invite_data.get("role", "member")
+
+    ok, reason, company_data = can_join_company(company_id)
+    if not ok:
+        return False, reason
+
+    ok, reason, invite_data = consume_invite(code)
+    if not ok:
+        return False, reason
+
+    user_data = {
+        "user_id": user_id,
+        "company_id": company_id,
+        "role": role,
+        "status": "active",
+        "joined_at": now_iso(),
+        "invited_by": invite_data.get("created_by", ""),
+        "invite_code": code,
+        "display_name": "",
+        "last_seen_at": now_iso(),
+    }
+
+    save_user(user_data)
+    add_user_to_company(company_id, user_id)
+
+    if role == "admin":
+        add_admin_to_company(company_id, user_id)
+
+    return True, "ok"
+
+
+def disable_invite(company_id, code):
+    code = normalize_invite_code(code)
+    invite_data = get_invite(code)
+    if not invite_data:
+        return False, "invite_not_found"
+
+    if invite_data.get("company_id") != company_id:
+        return False, "company_mismatch"
+
+    invite_data["status"] = "disabled"
+    save_invite(invite_data)
+    return True, "ok"
 
 # ----------------------------
 # Data
 # ----------------------------
-BRANCH_LETTERS = "WNESGK"
-
-
-def normalize_key(text: str) -> str:
-    text = unicodedata.normalize("NFKC", str(text))
-    text = text.upper()
-    text = re.sub(r"[ \u3000]+", "", text)
-    return text
-
-
 def load_pole_coords():
     with open("GPS.json", "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -79,37 +553,6 @@ def load_pole_coords():
 
 
 POLE_COORDS, GPS_POINTS = load_pole_coords()
-
-# ----------------------------
-# Constants / patterns
-# ----------------------------
-NEAR_OFFSETS = [1, -1, 2, -2, 3, -3]
-RANGE_PATTERN = re.compile(r"[～~]")
-POLE_PATTERN = re.compile(rf"^(.*?)(\d+)((?:[{BRANCH_LETTERS}]\d+)*)$")
-
-# ----------------------------
-# Messages
-# ----------------------------
-MSG_FRIEND = """はじめまして、電柱ナビのいっぱつちゃんだよ
-電柱名や径間名を送ると、その場所を地図で案内できるよ📍
-
-▼使い方
-そのまま送ればOK
-葛川25～26 / 谷垣内22
-複数まとめて送っても大丈夫👌
-
-電柱を1本だけ送ったときは
-その場所と、周辺200mの電柱地図も一緒に出すよ
-
-座標（緯度,経度）や、LINEの「＋」から位置情報を送ると
-近くの電柱をまとめて確認できるよ🗺️
-
-※ちょっとだけお願い
-地図を確認しながら探してるから、少し時間がかかることがあるよ
-見つけたらちゃんと案内するから、そのまま待っててね✨"""
-
-MSG_WAIT = """今探してるよ
-少し待っててね🔎"""
 
 # ----------------------------
 # Formatting helpers
@@ -203,52 +646,70 @@ def format_address_result(address_name: str, map_url: str) -> str:
 {address_name}
 {map_url}"""
 
-# ----------------------------
-# Basic text helpers
-# ----------------------------
-def normalize_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = text.upper()
+
+def format_multi_line_results(results, multi_map_url=None):
+    found_results = [r for r in results if r["found"]]
+    not_found_results = [r for r in results if not r["found"]]
+
+    lines = []
+
+    if found_results:
+        lines.append(f"検索結果 {len(found_results)}件")
+        lines.append("")
+
+        for i, r in enumerate(found_results):
+            lines.append(r["display_name"])
+            lines.append(r["url"])
+
+            if r["note"]:
+                lines.append(f"{r['note']}")
+
+            if i != len(found_results) - 1:
+                lines.append("")
+
+    if not_found_results:
+        if lines:
+            lines.append("")
+        lines.append("見つからなかったもの")
+        for r in not_found_results:
+            lines.append(f"- {r['display_name']}")
+
+    if multi_map_url:
+        if lines:
+            lines.append("")
+        lines.append("複数の候補をまとめた地図はこちら🗺️")
+        lines.append(multi_map_url)
+
+    return "\n".join(lines)
+
+
+def format_resolve_results(results, include_single_map=True, multi_map_url=None):
+    if not results:
+        return "入力が空です"
+
+    if len(results) >= 2:
+        return format_multi_line_results(results, multi_map_url=multi_map_url)
+
+    blocks = []
+
+    for r in results:
+        if r["found"]:
+            if r["is_range"]:
+                block = format_span_result(r["display_name"], r["url"], r["note"])
+            else:
+                map_url = r["map_url"] if include_single_map else None
+                block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
+        else:
+            block = format_not_found(r["display_name"])
+
+        blocks.append(block)
+
+    text = "\n\n".join(blocks)
+
+    if multi_map_url:
+        text += f"\n\n複数の候補をまとめた地図はこちら🗺️\n{multi_map_url}"
+
     return text
-
-
-def remove_spaces(text: str) -> str:
-    return re.sub(r"[ \u3000]+", "", text)
-
-
-def normalize_input_line(text: str) -> str:
-    return remove_spaces(normalize_text(text.strip()))
-
-
-def split_input_lines(text: str):
-    lines = [normalize_input_line(line) for line in text.splitlines()]
-    return [line for line in lines if line]
-
-
-def make_display_name(text: str) -> str:
-    return remove_spaces(normalize_text(text))
-
-
-def has_hikikomi(text: str) -> bool:
-    return "引込" in text or "引き込み" in text
-
-
-def google_maps_url(latlon: str) -> str:
-    return f"https://www.google.com/maps?q={latlon}"
-
-
-def parse_latlng(text: str):
-    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
-    if not m:
-        return None
-
-    lat = float(m.group(1))
-    lng = float(m.group(2))
-
-    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-        return None
-
-    return lat, lng
 
 # ----------------------------
 # Nearby search
@@ -316,13 +777,10 @@ def geocode_address(address: str):
 
 
 def build_map_url(lat, lng):
-    base_url = os.getenv("BASE_URL", "").rstrip("/")
-    return f"{base_url}/map?lat={lat}&lng={lng}"
+    return f"{BASE_URL}/map?lat={lat}&lng={lng}"
 
 
 def build_multi_map_url(points):
-    base_url = os.getenv("BASE_URL", "").rstrip("/")
-
     payload = []
     for p in points:
         payload.append({
@@ -343,7 +801,7 @@ def build_multi_map_url(points):
         print("[build_multi_map_url] REDIS_URL is not set")
         return None
 
-    return f"{base_url}/multi-map?id={map_id}"
+    return f"{BASE_URL}/multi-map?id={map_id}"
 
 
 def extract_found_points(results):
@@ -727,69 +1185,246 @@ def resolve_lines(text: str):
     return results
 
 
-def format_multi_line_results(results, multi_map_url=None):
-    found_results = [r for r in results if r["found"]]
-    not_found_results = [r for r in results if not r["found"]]
+def process_text_logic(user_text: str) -> str:
+    parsed = parse_latlng(user_text)
+    if parsed:
+        lat, lng = parsed
+        nearby = find_nearby(lat, lng, 200)
+        map_url = build_map_url(lat, lng)
+        if nearby:
+            return format_location_result(map_url, len(nearby))
+        return format_location_empty(map_url)
 
-    lines = []
-
-    if found_results:
-        lines.append(f"検索結果 {len(found_results)}件")
-        lines.append("")
-
-        for i, r in enumerate(found_results):
-            lines.append(r["display_name"])
-            lines.append(r["url"])
-
-            if r["note"]:
-                lines.append(f"{r['note']}")
-
-            if i != len(found_results) - 1:
-                lines.append("")
-
-    if not_found_results:
-        if lines:
-            lines.append("")
-        lines.append("見つからなかったもの")
-        for r in not_found_results:
-            lines.append(f"- {r['display_name']}")
-
-    if multi_map_url:
-        if lines:
-            lines.append("")
-        lines.append("複数の候補をまとめた地図はこちら🗺️")
-        lines.append(multi_map_url)
-
-    return "\n".join(lines)
-
-
-def format_resolve_results(results, include_single_map=True, multi_map_url=None):
-    if not results:
+    lines = split_input_lines(user_text)
+    if not lines:
         return "入力が空です"
 
-    if len(results) >= 2:
-        return format_multi_line_results(results, multi_map_url=multi_map_url)
+    if len(lines) >= 2:
+        results = resolve_lines(user_text)
+        points = extract_found_points(results)
 
-    blocks = []
+        multi_map_url = None
+        if len(points) >= 2:
+            multi_map_url = build_multi_map_url(points)
 
-    for r in results:
-        if r["found"]:
-            if r["is_range"]:
-                block = format_span_result(r["display_name"], r["url"], r["note"])
-            else:
-                map_url = r["map_url"] if include_single_map else None
-                block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
-        else:
-            block = format_not_found(r["display_name"])
+        return format_resolve_results(
+            results,
+            include_single_map=False,
+            multi_map_url=multi_map_url
+        )
 
-        blocks.append(block)
+    results = resolve_lines(user_text)
+    if results and results[0]["found"]:
+        return format_resolve_results(results)
 
-    text = "\n\n".join(blocks)
+    geo = geocode_address(user_text)
+    if geo:
+        lat, lng, address_name = geo
+        map_url = build_map_url(lat, lng)
+        return format_address_result(address_name, map_url)
 
-    if multi_map_url:
-        text += f"\n\n複数の候補をまとめた地図はこちら🗺️\n{multi_map_url}"
+    return format_resolve_results(results)
 
-    return text
+# ----------------------------
+# Management command handlers
+# ----------------------------
+def format_company_info(company_data):
+    return (
+        f"会社ID: {company_data.get('company_id')}\n"
+        f"会社名: {company_data.get('name')}\n"
+        f"状態: {company_data.get('status')}\n"
+        f"プラン: {company_data.get('plan')}\n"
+        f"人数上限: {company_data.get('user_limit')}\n"
+        f"登録人数: {count_company_users(company_data.get('company_id'))}人\n"
+        f"管理者数: {len(company_data.get('admin_user_ids', []))}人"
+    )
+
+
+def process_operator_command(user_id, user_text):
+    if not user_text.startswith("運営 "):
+        return None
+
+    if not is_operator(user_id):
+        return "運営コマンドを使える権限がないよ"
+
+    parts = user_text.split(maxsplit=4)
+    if len(parts) < 2:
+        return "運営コマンドの形式が不正だよ"
+
+    action = parts[1]
+
+    if action == "会社作成":
+        if len(parts) < 5:
+            return "使い方: 運営 会社作成 company_id 人数上限 会社名"
+
+        company_id = parts[2]
+        try:
+            user_limit = int(parts[3])
+        except ValueError:
+            return "人数上限は数字で入れてね"
+
+        company_name = parts[4]
+        ok, result = create_company(company_id, company_name, user_limit)
+        if not ok:
+            if result == "company_exists":
+                return "その会社IDはもう使われとるよ"
+            return f"会社作成に失敗したよ: {result}"
+
+        company_data = get_company(result)
+        return f"会社を作成したよ👌\n\n{format_company_info(company_data)}"
+
+    if action == "会社情報":
+        if len(parts) < 3:
+            return "使い方: 運営 会社情報 company_id"
+
+        company_id = normalize_key(parts[2])
+        company_data = get_company(company_id)
+        if not company_data:
+            return "会社が見つからんかったよ"
+
+        return format_company_info(company_data)
+
+    if action == "会社停止":
+        if len(parts) < 3:
+            return "使い方: 運営 会社停止 company_id"
+
+        company_id = normalize_key(parts[2])
+        company_data = get_company(company_id)
+        if not company_data:
+            return "会社が見つからんかったよ"
+
+        company_data["status"] = "suspended"
+        save_company(company_data)
+        return f"{company_id} を停止したよ"
+
+    if action == "会社再開":
+        if len(parts) < 3:
+            return "使い方: 運営 会社再開 company_id"
+
+        company_id = normalize_key(parts[2])
+        company_data = get_company(company_id)
+        if not company_data:
+            return "会社が見つからんかったよ"
+
+        company_data["status"] = "active"
+        save_company(company_data)
+        return f"{company_id} を再開したよ"
+
+    if action == "管理招待作成":
+        if len(parts) < 3:
+            return "使い方: 運営 管理招待作成 company_id [回数]"
+
+        company_id = normalize_key(parts[2])
+        max_uses = 1
+
+        if len(parts) >= 4:
+            try:
+                max_uses = int(parts[3])
+            except ValueError:
+                return "回数は数字で入れてね"
+
+        ok, reason, invite_data = create_invite(
+            company_id=company_id,
+            created_by=user_id,
+            role="admin",
+            max_uses=max_uses,
+            expires_days=7,
+        )
+        if not ok:
+            return f"管理者招待コードの作成に失敗したよ: {reason}"
+
+        return (
+            "管理者用の招待コードを作成したよ\n"
+            f"会社ID: {company_id}\n"
+            f"コード: {invite_data['code']}\n"
+            f"回数: {invite_data['max_uses']}\n"
+            f"期限: {invite_data.get('expires_at') or 'なし'}"
+        )
+
+    return "その運営コマンドはまだ対応してないよ"
+
+
+def process_admin_command(user_id, user_text, user_data):
+    role = user_data.get("role")
+    company_id = user_data.get("company_id")
+
+    if role not in ("admin", "operator"):
+        return None
+
+    if user_text.startswith("招待作成"):
+        parts = user_text.split(maxsplit=1)
+        max_uses = 1
+
+        if len(parts) >= 2:
+            try:
+                max_uses = int(parts[1])
+            except ValueError:
+                return "使い方: 招待作成 または 招待作成 3"
+
+        ok, reason, invite_data = create_invite(
+            company_id=company_id,
+            created_by=user_id,
+            role="member",
+            max_uses=max_uses,
+            expires_days=7,
+        )
+        if not ok:
+            return f"招待コード作成に失敗したよ: {reason}"
+
+        return (
+            "招待コードを作成したよ👌\n"
+            f"コード: {invite_data['code']}\n"
+            f"回数: {invite_data['max_uses']}\n"
+            f"期限: {invite_data.get('expires_at') or 'なし'}"
+        )
+
+    if user_text == "招待一覧":
+        codes = list_company_invite_codes(company_id)
+        if not codes:
+            return "この会社の招待コードはまだないよ"
+
+        lines = ["招待コード一覧"]
+        for code in codes:
+            invite_data = get_invite(code)
+            if not invite_data:
+                continue
+            lines.append(
+                f"{code} / {invite_data.get('role')} / "
+                f"{invite_data.get('status')} / "
+                f"{invite_data.get('used_count', 0)}/{invite_data.get('max_uses', 1)}"
+            )
+
+        return "\n".join(lines)
+
+    if user_text.startswith("招待停止"):
+        parts = user_text.split(maxsplit=1)
+        if len(parts) < 2:
+            return "使い方: 招待停止 コード"
+
+        code = parts[1].strip()
+        ok, reason = disable_invite(company_id, code)
+        if not ok:
+            return f"招待停止に失敗したよ: {reason}"
+
+        return f"{normalize_invite_code(code)} を停止したよ"
+
+    if user_text == "利用者一覧":
+        user_ids = list_company_users(company_id)
+        if not user_ids:
+            return "利用者はまだ登録されとらんよ"
+
+        lines = [f"利用者一覧 {len(user_ids)}人"]
+        for uid in user_ids:
+            u = get_user(uid)
+            if not u:
+                continue
+            role = u.get("role", "")
+            status = u.get("status", "")
+            lines.append(f"{role} / {status} / {uid}")
+
+        return "\n".join(lines)
+
+    return None
 
 # ----------------------------
 # Routes
@@ -888,56 +1523,24 @@ def push_if_possible(to_id=None, text=""):
         print(f"[push_if_possible] failed: {e}")
 
 
-def process_text_logic(user_text: str) -> str:
-    parsed = parse_latlng(user_text)
-    if parsed:
-        lat, lng = parsed
-        nearby = find_nearby(lat, lng, 200)
-        map_url = build_map_url(lat, lng)
-        if nearby:
-            return format_location_result(map_url, len(nearby))
-        return format_location_empty(map_url)
-
-    lines = split_input_lines(user_text)
-    if not lines:
-        return "入力が空です"
-
-    if len(lines) >= 2:
-        results = resolve_lines(user_text)
-        points = extract_found_points(results)
-
-        multi_map_url = None
-        if len(points) >= 2:
-            multi_map_url = build_multi_map_url(points)
-
-        return format_resolve_results(
-            results,
-            include_single_map=False,
-            multi_map_url=multi_map_url
-        )
-
-    results = resolve_lines(user_text)
-    if results and results[0]["found"]:
-        return format_resolve_results(results)
-
-    geo = geocode_address(user_text)
-    if geo:
-        lat, lng, address_name = geo
-        map_url = build_map_url(lat, lng)
-        return format_address_result(address_name, map_url)
-
-    return format_resolve_results(results)
+def reply_text_message(reply_token, text):
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
 
 # ----------------------------
 # LINE handlers
 # ----------------------------
 @handler.add(FollowEvent)
 def handle_follow(event):
+    user_id = getattr(event.source, "user_id", None)
+
+    allowed, _, _, _ = is_user_allowed(user_id)
+    if allowed:
+        text = MSG_FRIEND
+    else:
+        text = f"{MSG_FRIEND}\n\n{MSG_REGISTER_GUIDE}"
+
     try:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=MSG_FRIEND)
-        )
+        reply_text_message(event.reply_token, text)
     except Exception as e:
         print(f"[handle_follow] failed: {e}")
 
@@ -946,6 +1549,75 @@ def handle_follow(event):
 def handle_text(event):
     user_text = event.message.text.strip()
     user_id = getattr(event.source, "user_id", None)
+
+    # 運営コマンドは未登録でも通す
+    operator_reply = process_operator_command(user_id, user_text)
+    if operator_reply is not None:
+        reply_text_message(event.reply_token, operator_reply)
+        return
+
+    # 初回参加は未登録でも通す
+    if user_text.startswith("参加"):
+        parts = user_text.split(maxsplit=1)
+        code = parts[1].strip() if len(parts) >= 2 else ""
+
+        ok, reason = join_company_with_invite(user_id, code)
+
+        if ok:
+            reply_text = MSG_JOIN_SUCCESS
+        elif reason == "already_registered":
+            reply_text = MSG_ALREADY_REGISTERED
+        elif reason in ("invite_not_found", "invite_code_empty"):
+            reply_text = MSG_JOIN_FAILED_INVALID
+        elif reason in ("user_limit_reached",):
+            reply_text = MSG_JOIN_FAILED_LIMIT
+        elif reason in ("company_inactive", "invite_inactive", "invite_limit_reached", "invite_expired"):
+            reply_text = MSG_JOIN_FAILED_INACTIVE
+        else:
+            reply_text = "登録処理でエラーが起きたよ💦 もう一度試してね"
+
+        reply_text_message(event.reply_token, reply_text)
+        return
+
+    # 通常利用可否判定
+    allowed, reason, user_data, company_data = is_user_allowed(user_id)
+
+if not allowed:
+    candidate_code = user_text
+
+    if user_text.startswith("参加"):
+        parts = user_text.split(maxsplit=1)
+        candidate_code = parts[1].strip() if len(parts) >= 2 else ""
+
+    normalized_code = normalize_invite_code(candidate_code)
+    invite_data = get_invite(normalized_code) if normalized_code else None
+
+    if invite_data:
+        ok, join_reason = join_company_with_invite(user_id, normalized_code)
+
+        if ok:
+            reply_text = MSG_JOIN_SUCCESS
+        elif join_reason == "already_registered":
+            reply_text = MSG_ALREADY_REGISTERED
+        elif join_reason in ("user_limit_reached",):
+            reply_text = MSG_JOIN_FAILED_LIMIT
+        elif join_reason in ("company_inactive", "invite_inactive", "invite_limit_reached", "invite_expired"):
+            reply_text = MSG_JOIN_FAILED_INACTIVE
+        else:
+            reply_text = MSG_JOIN_FAILED_INVALID
+
+        reply_text_message(event.reply_token, reply_text)
+        return
+
+    reply_text_message(event.reply_token, MSG_REGISTER_GUIDE)
+    return
+
+    # 管理者コマンド
+    admin_reply = process_admin_command(user_id, user_text, user_data)
+    if admin_reply is not None:
+        touch_user(user_data)
+        reply_text_message(event.reply_token, admin_reply)
+        return
 
     done = {"flag": False}
 
@@ -961,14 +1633,19 @@ def handle_text(event):
     finally:
         done["flag"] = True
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    touch_user(user_data)
+    reply_text_message(event.reply_token, reply_text)
 
 
 @handler.add(MessageEvent, message=LocationMessage)
 def handle_location(event):
+    user_id = getattr(event.source, "user_id", None)
+    allowed, reason, user_data, company_data = is_user_allowed(user_id)
+
+    if not allowed:
+        reply_text_message(event.reply_token, MSG_ACCESS_DENIED)
+        return
+
     lat = event.message.latitude
     lng = event.message.longitude
 
@@ -989,10 +1666,8 @@ def handle_location(event):
     else:
         reply_text = format_location_empty(map_url, header=header)
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    touch_user(user_data)
+    reply_text_message(event.reply_token, reply_text)
 
 
 if __name__ == "__main__":
