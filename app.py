@@ -283,6 +283,15 @@ def list_company_invite_codes(company_id):
         return []
     return sorted(redis_client.smembers(f"company_invites:{company_id}"))
 
+
+def count_keys_by_pattern(pattern: str) -> int:
+    if not redis_client:
+        return -1
+    count = 0
+    for _ in redis_client.scan_iter(match=pattern):
+        count += 1
+    return count
+
 # ----------------------------
 # User management helpers
 # ----------------------------
@@ -1339,6 +1348,22 @@ def process_operator_command(user_id, user_text):
             f"コード: {invite_data['code']}\n"
             f"回数: {invite_data['max_uses']}\n"
             f"期限: {invite_data.get('expires_at') or 'なし'}"
+        )
+
+    if action == "Redis確認":
+        company_count = count_keys_by_pattern("company:*")
+        user_count = count_keys_by_pattern("user:*")
+        invite_count = count_keys_by_pattern("invite:*")
+        company_users_count = count_keys_by_pattern("company_users:*")
+        multi_map_count = count_keys_by_pattern("multi_map:*")
+
+        return (
+            "Redis確認\n"
+            f"company:* {company_count}件\n"
+            f"user:* {user_count}件\n"
+            f"invite:* {invite_count}件\n"
+            f"company_users:* {company_users_count}件\n"
+            f"multi_map:* {multi_map_count}件"
         )
 
     return "その運営コマンドはまだ対応してないよ"
