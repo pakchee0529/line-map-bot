@@ -1583,40 +1583,42 @@ def handle_text(event):
 
     # 通常利用可否判定
     allowed, reason, user_data, company_data = is_user_allowed(user_id)
+    # temporary recovery mode: 利用者管理の不整合解消まで通常利用制限を無効化
+    allowed = True
 
-    # 未登録ユーザーは、招待コード単体 or 「参加 コード」で登録可能
-    if not allowed:
-        candidate_code = user_text
-
-        if user_text.startswith("参加"):
-            parts = user_text.split(maxsplit=1)
-            candidate_code = parts[1].strip() if len(parts) >= 2 else ""
-
-        normalized_code = normalize_invite_code(candidate_code)
-        invite_data = get_invite(normalized_code) if normalized_code else None
-
-        if invite_data:
-            ok, join_reason = join_company_with_invite(user_id, normalized_code)
-
-            if ok:
-                reply_text = MSG_JOIN_SUCCESS
-            elif join_reason == "already_registered":
-                reply_text = MSG_ALREADY_REGISTERED
-            elif join_reason in ("user_limit_reached",):
-                reply_text = MSG_JOIN_FAILED_LIMIT
-            elif join_reason in ("company_inactive", "invite_inactive", "invite_limit_reached", "invite_expired"):
-                reply_text = MSG_JOIN_FAILED_INACTIVE
-            else:
-                reply_text = MSG_JOIN_FAILED_INVALID
-
-            reply_text_message(event.reply_token, reply_text)
-            return
-
-        reply_text_message(event.reply_token, MSG_REGISTER_GUIDE)
-        return
+    # temporary recovery mode: 未登録ユーザーの参加案内/利用ブロックを一時停止
+    # if not allowed:
+    #     candidate_code = user_text
+    #
+    #     if user_text.startswith("参加"):
+    #         parts = user_text.split(maxsplit=1)
+    #         candidate_code = parts[1].strip() if len(parts) >= 2 else ""
+    #
+    #     normalized_code = normalize_invite_code(candidate_code)
+    #     invite_data = get_invite(normalized_code) if normalized_code else None
+    #
+    #     if invite_data:
+    #         ok, join_reason = join_company_with_invite(user_id, normalized_code)
+    #
+    #         if ok:
+    #             reply_text = MSG_JOIN_SUCCESS
+    #         elif join_reason == "already_registered":
+    #             reply_text = MSG_ALREADY_REGISTERED
+    #         elif join_reason in ("user_limit_reached",):
+    #             reply_text = MSG_JOIN_FAILED_LIMIT
+    #         elif join_reason in ("company_inactive", "invite_inactive", "invite_limit_reached", "invite_expired"):
+    #             reply_text = MSG_JOIN_FAILED_INACTIVE
+    #         else:
+    #             reply_text = MSG_JOIN_FAILED_INVALID
+    #
+    #         reply_text_message(event.reply_token, reply_text)
+    #         return
+    #
+    #     reply_text_message(event.reply_token, MSG_REGISTER_GUIDE)
+    #     return
 
     # 管理者コマンド
-    admin_reply = process_admin_command(user_id, user_text, user_data)
+    admin_reply = process_admin_command(user_id, user_text, user_data) if user_data else None
     if admin_reply is not None:
         touch_user(user_data)
         reply_text_message(event.reply_token, admin_reply)
@@ -1644,10 +1646,10 @@ def handle_text(event):
 def handle_location(event):
     user_id = getattr(event.source, "user_id", None)
     allowed, reason, user_data, company_data = is_user_allowed(user_id)
-
-    if not allowed:
-        reply_text_message(event.reply_token, MSG_ACCESS_DENIED)
-        return
+    # temporary recovery mode: 利用者管理の不整合解消まで位置情報利用制限を無効化
+    # if not allowed:
+    #     reply_text_message(event.reply_token, MSG_ACCESS_DENIED)
+    #     return
 
     lat = event.message.latitude
     lng = event.message.longitude
