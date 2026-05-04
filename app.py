@@ -132,6 +132,43 @@ def normalize_input_line(text: str) -> str:
     return remove_spaces(normalize_text(text.strip()))
 
 
+def extract_urls_from_reply(text: str):
+    if not text:
+        return text
+    urls = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            urls.append(s)
+    if not urls:
+        return text
+    return "\n".join(urls)
+
+
+def process_url_only_command(user_id, user_text):
+    if not user_id:
+        return None
+    lines = split_input_lines(user_text)
+    if len(lines) != 1:
+        return None
+    key = lines[0]
+    if key == "URLのみON":
+        return (
+            "URLのみモードをONにしたよ"
+            if set_url_only_mode(user_id, True)
+            else "Redisが無いから設定を保存できなかったよ💦"
+        )
+    if key == "URLのみOFF":
+        return (
+            "URLのみモードをOFFにしたよ"
+            if set_url_only_mode(user_id, False)
+            else "Redisが無いから設定を保存できなかったよ💦"
+        )
+    if key == "URLのみ":
+        return f"現在: {'ON' if is_url_only_mode(user_id) else 'OFF'}"
+    return None
+
+
 def split_input_lines(text: str):
     lines = [normalize_input_line(line) for line in text.splitlines()]
     return [line for line in lines if line]
@@ -230,6 +267,35 @@ def save_user(user_data):
 
     user_id = payload["user_id"]
     return redis_json_set(f"user:{user_id}", payload)
+
+
+def get_user_setting(user_id):
+    if not user_id or not redis_client:
+        return {}
+    raw = redis_json_get(f"user_settings:{user_id}")
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def save_user_setting(user_id, settings):
+    if not user_id or not redis_client:
+        return False
+    payload = dict(settings)
+    payload["updated_at"] = now_iso()
+    return redis_json_set(f"user_settings:{user_id}", payload)
+
+
+def is_url_only_mode(user_id):
+    return bool(get_user_setting(user_id).get("url_only"))
+
+
+def set_url_only_mode(user_id, enabled):
+    if not user_id:
+        return False
+    cur = get_user_setting(user_id)
+    cur["url_only"] = bool(enabled)
+    return save_user_setting(user_id, cur)
 
 
 def get_invite(code):
@@ -1732,6 +1798,12 @@ def handle_text(event):
         reply_text_message(event.reply_token, admin_reply)
         return
 
+    url_only_cmd_reply = process_url_only_command(user_id, user_text)
+    if url_only_cmd_reply is not None:
+        touch_user(user_data)
+        reply_text_message(event.reply_token, url_only_cmd_reply)
+        return
+
     done = {"flag": False}
 
     def delayed_notice():
@@ -1745,6 +1817,9 @@ def handle_text(event):
         reply_text = process_text_logic(user_text)
     finally:
         done["flag"] = True
+
+    if user_id and is_url_only_mode(user_id):
+        reply_text = extract_urls_from_reply(reply_text)
 
     touch_user(user_data)
     reply_text_message(event.reply_token, reply_text)
