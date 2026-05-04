@@ -813,6 +813,75 @@ def build_multi_map_url(points):
     return f"{BASE_URL}/multi-map?id={map_id}"
 
 
+def build_two_point_multi_map_url(p1_name: str, lat1: float, lng1: float, p2_name: str, lat2: float, lng2: float):
+    q = urllib.parse.urlencode(
+        {
+            "p1n": p1_name or "始点",
+            "p1": f"{lat1},{lng1}",
+            "p2n": p2_name or "終点",
+            "p2": f"{lat2},{lng2}",
+        }
+    )
+    return f"{BASE_URL}/multi-map?{q}"
+
+
+def resolve_span_endpoint_adopted(key: str):
+    if not key:
+        return None
+    if exact_match(key):
+        return key
+    return find_first_existing(general_search_order(key))
+
+
+def format_span_two_point_result(display_name: str, url: str, note=None) -> str:
+    lines = [
+        display_name,
+        "始点と終点を2点で確認できる地図はこちら🗺️",
+        url,
+    ]
+    if note:
+        lines.extend(["", note])
+    return "\n".join(lines)
+
+
+def try_span_two_point_reply(line: str):
+    info = create_search_keys(line)
+    if not info["is_range"] or not info["back_key"] or info["hikikomi"]:
+        return None
+
+    k_front = resolve_span_endpoint_adopted(info["front_key"])
+    k_back = resolve_span_endpoint_adopted(info["back_key"])
+    if not k_front or not k_back:
+        return None
+
+    latlon1 = POLE_COORDS.get(k_front)
+    latlon2 = POLE_COORDS.get(k_back)
+    if not latlon1 or not latlon2:
+        return None
+
+    parsed1 = parse_latlng(latlon1)
+    parsed2 = parse_latlng(latlon2)
+    if not parsed1 or not parsed2:
+        return None
+
+    lat1, lng1 = parsed1
+    lat2, lng2 = parsed2
+
+    note = None
+    notes = []
+    if k_front != info["front_key"]:
+        notes.append(f"始点（{info['front_key']}→{k_front}）")
+    if k_back != info["back_key"]:
+        notes.append(f"終点（{info['back_key']}→{k_back}）")
+    if notes:
+        note = "ぴったりの候補がなかったから近い候補で案内してるよ\n" + "\n".join(notes)
+
+    url = build_two_point_multi_map_url(
+        info["front_key"], lat1, lng1, info["back_key"], lat2, lng2
+    )
+    return format_span_two_point_result(info["display_name"], url, note)
+
+
 def extract_found_points(results):
     points = []
 
@@ -1222,6 +1291,10 @@ def process_text_logic(user_text: str) -> str:
             multi_map_url=multi_map_url
         )
 
+    span_two = try_span_two_point_reply(lines[0])
+    if span_two is not None:
+        return span_two
+
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
         return format_resolve_results(results)
@@ -1486,42 +1559,60 @@ def map_view():
 def multi_map_view():
     map_id = request.args.get("id")
 
-    if not map_id:
-        return "missing id", 400
+    if map_id:
+        if not redis_client:
+            return "redis is not configured", 500
 
-    if not redis_client:
-        return "redis is not configured", 500
+        raw = redis_client.get(f"multi_map:{map_id}")
 
-    raw = redis_client.get(f"multi_map:{map_id}")
+        if not raw:
+            return "data expired or not found", 404
 
-    if not raw:
-        return "data expired or not found", 404
-
-    try:
-        points = json.loads(raw)
-    except Exception:
-        return "invalid stored data", 500
-
-    valid_points = []
-
-    for p in points:
         try:
-            lat = float(p["lat"])
-            lng = float(p["lng"])
-            name = str(p.get("name", "電柱"))
-
-            valid_points.append({
-                "name": name,
-                "lat": lat,
-                "lng": lng,
-            })
+            points = json.loads(raw)
         except Exception:
-            pass
+            return "invalid stored data", 500
 
-    if not valid_points:
-        return "no valid points", 400
+        valid_points = []
 
-    return render_template("multi_map.html", points=valid_points)
+        for p in points:
+            try:
+                lat = float(p["lat"])
+                lng = float(p["lng"])
+                name = str(p.get("name", "電柱"))
+
+                valid_points.append({
+                    "name": name,
+                    "lat": lat,
+                    "lng": lng,
+                })
+            except Exception:
+                pass
+
+        if not valid_points:
+            return "no valid points", 400
+
+        return render_template("multi_map.html", points=valid_points)
+
+    p1 = request.args.get("p1")
+    p2 = request.args.get("p2")
+    if p1 and p2:
+        p1n = request.args.get("p1n") or "始点"
+        p2n = request.args.get("p2n") or "終点"
+        ll1 = parse_latlng(p1)
+        ll2 = parse_latlng(p2)
+        if not ll1 or not ll2:
+            return "invalid p1/p2", 400
+
+        lat1, lng1 = ll1
+        lat2, lng2 = ll2
+        valid_points = [
+            {"name": str(p1n), "lat": lat1, "lng": lng1},
+            {"name": str(p2n), "lat": lat2, "lng": lng2},
+        ]
+        return render_template("multi_map.html", points=valid_points)
+
+    return "missing id or p1/p2", 400
 
 
 @app.route("/callback", methods=["POST"])
