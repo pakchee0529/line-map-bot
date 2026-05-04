@@ -21,6 +21,7 @@ from linebot.models import (
     MessageEvent,
     TextMessage,
     TextSendMessage,
+    FlexSendMessage,
     LocationMessage,
     FollowEvent,
 )
@@ -164,6 +165,63 @@ class LineSearchReply:
 
 def extract_urls_from_reply(text: str):
     return LineSearchReply.from_plain_text(text).as_line_text(url_only=True)
+
+
+def _is_two_point_multi_map_query_url(url: str) -> bool:
+    if not url.startswith(("http://", "https://")):
+        return False
+    lo = url.lower()
+    if "multi-map" not in lo:
+        return False
+    return "p1=" in url and "p2=" in url
+
+
+def is_span_two_point_line_search_reply(search_reply: LineSearchReply) -> bool:
+    if len(search_reply.urls) != 1:
+        return False
+    url = search_reply.urls[0]
+    if not _is_two_point_multi_map_query_url(url):
+        return False
+    lines = search_reply.plain_text.splitlines()
+    if len(lines) < 2:
+        return False
+    if lines[0].strip().startswith(("http://", "https://")):
+        return False
+    if lines[1].strip() != url:
+        return False
+    return True
+
+
+def build_span_two_point_flex_message(search_reply: LineSearchReply):
+    if not is_span_two_point_line_search_reply(search_reply):
+        return None
+    url = search_reply.urls[0]
+    title = search_reply.plain_text.splitlines()[0].strip()
+    alt = (title or "2点地図")[:400]
+    contents = {
+        "type": "bubble",
+        "size": "kilo",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": title,
+                    "weight": "bold",
+                    "size": "lg",
+                    "wrap": True,
+                },
+                {
+                    "type": "button",
+                    "style": "link",
+                    "height": "sm",
+                    "action": {"type": "uri", "label": "2点地図を開く", "uri": url},
+                },
+            ],
+        },
+    }
+    return FlexSendMessage(alt_text=alt, contents=contents)
 
 
 def process_url_only_command(user_id, user_text):
@@ -1687,8 +1745,8 @@ def multi_map_view():
     p1 = request.args.get("p1")
     p2 = request.args.get("p2")
     if p1 and p2:
-        p1n = request.args.get("p1n") or "始点"
-        p2n = request.args.get("p2n") or "終点"
+        p1n = (request.args.get("p1n") or "").strip()
+        p2n = (request.args.get("p2n") or "").strip()
         ll1 = parse_latlng(p1)
         ll2 = parse_latlng(p2)
         if not ll1 or not ll2:
@@ -1745,6 +1803,18 @@ def push_if_possible(to_id=None, text=""):
 
 def reply_text_message(reply_token, text):
     line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
+
+
+def reply_search_message(reply_token, search_reply: LineSearchReply, url_only: bool):
+    if url_only:
+        reply_text_message(reply_token, search_reply.as_line_text(url_only=True))
+        return
+    flex_msg = build_span_two_point_flex_message(search_reply)
+    if flex_msg is not None:
+        line_bot_api.reply_message(reply_token, flex_msg)
+        return
+    reply_text_message(reply_token, search_reply.as_line_text(url_only=False))
+
 
 # ----------------------------
 # LINE handlers
@@ -1840,10 +1910,9 @@ def handle_text(event):
         done["flag"] = True
 
     url_only = bool(user_id and is_url_only_mode(user_id))
-    reply_text = search_reply.as_line_text(url_only=url_only)
 
     touch_user(user_data)
-    reply_text_message(event.reply_token, reply_text)
+    reply_search_message(event.reply_token, search_reply, url_only)
 
 
 @handler.add(MessageEvent, message=LocationMessage)

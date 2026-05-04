@@ -14,27 +14,29 @@
       margin: 0;
       padding: 0;
     }
-    .leaflet-popup.span-two-popup .leaflet-popup-content-wrapper {
-      padding: 0;
-      border-radius: 4px;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.25);
-    }
-    .leaflet-popup.span-two-popup .leaflet-popup-content {
-      margin: 0;
-      padding: 3px 8px;
-      line-height: 1.25;
-      font-size: 12px;
-      min-width: 0;
-    }
-    .leaflet-popup.span-two-popup .leaflet-popup-tip-container {
-      margin-top: -1px;
-    }
-    .span-two-hit {
-      display: block;
-      max-width: 11rem;
-      color: #111;
-      text-decoration: none;
+    /* 2点径間: 常時表示の小さめラベル（ピンの上、コンパクト） */
+    .leaflet-tooltip.span-two-tt {
+      margin-top: -6px !important;
+      padding: 2px 6px !important;
+      font-size: 11px !important;
+      line-height: 1.2 !important;
+      font-weight: 500;
+      border: 1px solid rgba(0, 0, 0, 0.12) !important;
+      border-radius: 3px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+      background: rgba(255, 255, 255, 0.96) !important;
+      color: #111 !important;
+      max-width: 10rem;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      pointer-events: auto;
+    }
+    .span-two-tip-hit {
+      color: inherit;
+      text-decoration: none;
+      display: block;
+      max-width: 10rem;
       overflow: hidden;
       text-overflow: ellipsis;
     }
@@ -55,7 +57,6 @@
     }).addTo(map);
 
     const bounds = [];
-    const twoPointMarkers = [];
 
     function escapeHtml(s) {
       return String(s)
@@ -71,16 +72,15 @@
       if (isTwoPointMode) {
         const gurl = p.google_url || googleUrl;
         const label = escapeHtml(p.name != null ? p.name : "");
-        const compact = `<a class="span-two-hit" href="${gurl}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-        marker.bindPopup(compact, {
-          className: "span-two-popup",
-          offset: [0, -10],
-          autoPan: true,
-          autoPanPadding: [12, 12],
-          autoClose: false,
-          closeOnClick: false,
+        const tipHtml = `<a class="span-two-tip-hit" href="${gurl}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+        marker.bindTooltip(tipHtml, {
+          permanent: true,
+          direction: "top",
+          offset: [0, -6],
+          opacity: 1,
+          className: "span-two-tt",
+          interactive: true,
         });
-        twoPointMarkers.push(marker);
       } else {
         const roleLine = p.role
           ? `<div style="font-weight:600;margin-bottom:4px;">${p.role}</div>`
@@ -110,10 +110,6 @@
         padding: [30, 30],
         maxZoom: 18
       });
-    }
-
-    if (isTwoPointMode && twoPointMarkers.length) {
-      twoPointMarkers.forEach(m => m.openPopup());
     }
   </script>
 </body>
