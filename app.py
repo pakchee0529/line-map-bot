@@ -1594,8 +1594,7 @@ def multi_map_view():
         return render_template(
             "multi_map.html",
             points=valid_points,
-            two_point_mode=False,
-            span_name=None,
+            is_two_point_mode=False,
         )
 
     p1 = request.args.get("p1")
@@ -1611,15 +1610,23 @@ def multi_map_view():
         lat1, lng1 = ll1
         lat2, lng2 = ll2
         valid_points = [
-            {"name": str(p1n), "lat": lat1, "lng": lng1, "role": "始点"},
-            {"name": str(p2n), "lat": lat2, "lng": lng2, "role": "終点"},
+            {
+                "name": str(p1n),
+                "lat": lat1,
+                "lng": lng1,
+                "google_url": google_maps_url(f"{lat1},{lng1}"),
+            },
+            {
+                "name": str(p2n),
+                "lat": lat2,
+                "lng": lng2,
+                "google_url": google_maps_url(f"{lat2},{lng2}"),
+            },
         ]
-        span_name = request.args.get("sn") or ""
         return render_template(
             "multi_map.html",
             points=valid_points,
-            two_point_mode=True,
-            span_name=span_name,
+            is_two_point_mode=True,
         )
 
     return "missing id or p1/p2", 400

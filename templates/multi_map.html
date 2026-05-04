@@ -14,6 +14,30 @@
       margin: 0;
       padding: 0;
     }
+    .leaflet-popup.span-two-popup .leaflet-popup-content-wrapper {
+      padding: 0;
+      border-radius: 4px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+    }
+    .leaflet-popup.span-two-popup .leaflet-popup-content {
+      margin: 0;
+      padding: 3px 8px;
+      line-height: 1.25;
+      font-size: 12px;
+      min-width: 0;
+    }
+    .leaflet-popup.span-two-popup .leaflet-popup-tip-container {
+      margin-top: -1px;
+    }
+    .span-two-hit {
+      display: block;
+      max-width: 11rem;
+      color: #111;
+      text-decoration: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
   </style>
 </head>
 <body>
@@ -22,8 +46,7 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const points = {{ points|tojson }};
-    const twoPointMode = {{ two_point_mode|default(false)|tojson }};
-    const spanName = {{ span_name|default("", true)|tojson }};
+    const isTwoPointMode = {{ is_two_point_mode|default(false)|tojson }};
 
     const map = L.map('map');
 
@@ -34,38 +57,35 @@
     const bounds = [];
     const twoPointMarkers = [];
 
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/"/g, "&quot;");
+    }
+
     points.forEach(p => {
       const marker = L.marker([p.lat, p.lng]).addTo(map);
 
       const googleUrl = `https://www.google.com/maps?q=${p.lat},${p.lng}`;
-      let popupHtml;
-      if (twoPointMode) {
-        const roleLine = p.role
-          ? `<div style="font-weight:600;">${p.role}</div>`
-          : "";
-        const nameLine = spanName || p.name || "";
-        const nameBlock = nameLine
-          ? `<div style="margin-top:4px;">${nameLine}</div>`
-          : "";
-        popupHtml = `
-  <div>
-    ${roleLine}
-    ${nameBlock}
-    <div style="margin-top: 8px;">
-      <a href="${googleUrl}" target="_blank" rel="noopener noreferrer"
-         onclick="return confirm('Googleマップで開きますか？');">
-        Googleマップで開く
-      </a>
-    </div>
-  </div>
-`;
-        marker.bindPopup(popupHtml, { autoClose: false, closeOnClick: false });
+      if (isTwoPointMode) {
+        const gurl = p.google_url || googleUrl;
+        const label = escapeHtml(p.name != null ? p.name : "");
+        const compact = `<a class="span-two-hit" href="${gurl}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+        marker.bindPopup(compact, {
+          className: "span-two-popup",
+          offset: [0, -10],
+          autoPan: true,
+          autoPanPadding: [12, 12],
+          autoClose: false,
+          closeOnClick: false,
+        });
         twoPointMarkers.push(marker);
       } else {
         const roleLine = p.role
           ? `<div style="font-weight:600;margin-bottom:4px;">${p.role}</div>`
           : "";
-        popupHtml = `
+        const popupHtml = `
   <div>
     ${roleLine}
     <div>${p.name}</div>
@@ -92,7 +112,7 @@
       });
     }
 
-    if (twoPointMode && twoPointMarkers.length) {
+    if (isTwoPointMode && twoPointMarkers.length) {
       twoPointMarkers.forEach(m => m.openPopup());
     }
   </script>
