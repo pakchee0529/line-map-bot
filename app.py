@@ -663,14 +663,14 @@ def format_multi_line_results(results, multi_map_url=None):
     lines = []
 
     if found_results:
-        lines.append(f"検索結果 {len(found_results)}件")
-        lines.append("")
-
         for i, r in enumerate(found_results):
             lines.append(r["display_name"])
-            lines.append(r["url"])
+            if r.get("span_map_url"):
+                lines.append(r["span_map_url"])
+            else:
+                lines.append(r["url"])
 
-            if r["note"]:
+            if r.get("note") and not r.get("span_map_url"):
                 lines.append(f"{r['note']}")
 
             if i != len(found_results) - 1:
@@ -704,7 +704,10 @@ def format_resolve_results(results, include_single_map=True, multi_map_url=None)
     for r in results:
         if r["found"]:
             if r["is_range"]:
-                block = format_span_result(r["display_name"], r["url"], r["note"])
+                if r.get("span_map_url"):
+                    block = f"{r['display_name']}\n{r['span_map_url']}"
+                else:
+                    block = format_span_result(r["display_name"], r["url"], r["note"])
             else:
                 map_url = r["map_url"] if include_single_map else None
                 block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
@@ -833,19 +836,7 @@ def resolve_span_endpoint_adopted(key: str):
     return find_first_existing(general_search_order(key))
 
 
-def format_span_two_point_result(display_name: str, url: str, note=None) -> str:
-    lines = [
-        display_name,
-        "始点と終点を2点で確認できる地図はこちら🗺️",
-        url,
-    ]
-    if note:
-        lines.extend(["", note])
-    return "\n".join(lines)
-
-
-def try_span_two_point_reply(line: str):
-    info = create_search_keys(line)
+def compute_span_two_point_url(info: dict):
     if not info["is_range"] or not info["back_key"] or info["hikikomi"]:
         return None
 
@@ -867,19 +858,9 @@ def try_span_two_point_reply(line: str):
     lat1, lng1 = parsed1
     lat2, lng2 = parsed2
 
-    note = None
-    notes = []
-    if k_front != info["front_key"]:
-        notes.append(f"始点（{info['front_key']}→{k_front}）")
-    if k_back != info["back_key"]:
-        notes.append(f"終点（{info['back_key']}→{k_back}）")
-    if notes:
-        note = "ぴったりの候補がなかったから近い候補で案内してるよ\n" + "\n".join(notes)
-
-    url = build_two_point_multi_map_url(
+    return build_two_point_multi_map_url(
         info["front_key"], lat1, lng1, info["back_key"], lat2, lng2
     )
-    return format_span_two_point_result(info["display_name"], url, note)
 
 
 def extract_found_points(results):
@@ -1227,6 +1208,7 @@ def resolve_one(line: str):
             "is_range": is_range,
             "map_url": None,
             "adopted": None,
+            "span_map_url": None,
         }
 
     latlon = POLE_COORDS[adopted]
@@ -1242,6 +1224,11 @@ def resolve_one(line: str):
         if parsed:
             map_url = build_map_url(parsed[0], parsed[1])
 
+    span_map_url = compute_span_two_point_url(info)
+    if span_map_url:
+        url = None
+        note = None
+
     return {
         "found": True,
         "display_name": display_name,
@@ -1250,6 +1237,7 @@ def resolve_one(line: str):
         "is_range": is_range,
         "map_url": map_url,
         "adopted": adopted,
+        "span_map_url": span_map_url,
     }
 
 
@@ -1290,10 +1278,6 @@ def process_text_logic(user_text: str) -> str:
             include_single_map=False,
             multi_map_url=multi_map_url
         )
-
-    span_two = try_span_two_point_reply(lines[0])
-    if span_two is not None:
-        return span_two
 
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
@@ -1607,8 +1591,8 @@ def multi_map_view():
         lat1, lng1 = ll1
         lat2, lng2 = ll2
         valid_points = [
-            {"name": str(p1n), "lat": lat1, "lng": lng1},
-            {"name": str(p2n), "lat": lat2, "lng": lng2},
+            {"name": str(p1n), "lat": lat1, "lng": lng1, "role": "始点"},
+            {"name": str(p2n), "lat": lat2, "lng": lng2, "role": "終点"},
         ]
         return render_template("multi_map.html", points=valid_points)
 

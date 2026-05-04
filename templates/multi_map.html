@@ -35,8 +35,12 @@
       const marker = L.marker([p.lat, p.lng]).addTo(map);
   
       const googleUrl = `https://www.google.com/maps?q=${p.lat},${p.lng}`;
+      const roleLine = p.role
+        ? `<div style="font-weight:600;margin-bottom:4px;">${p.role}</div>`
+        : "";
       const popupHtml = `
   <div>
+    ${roleLine}
     <div>${p.name}</div>
     <div style="margin-top: 6px;">
       <a href="${googleUrl}" target="_blank" rel="noopener noreferrer"
