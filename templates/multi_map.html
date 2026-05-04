@@ -22,23 +22,50 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const points = {{ points|tojson }};
-  
+    const twoPointMode = {{ two_point_mode|default(false)|tojson }};
+    const spanName = {{ span_name|default("", true)|tojson }};
+
     const map = L.map('map');
-  
+
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
-  
+
     const bounds = [];
-  
+    const twoPointMarkers = [];
+
     points.forEach(p => {
       const marker = L.marker([p.lat, p.lng]).addTo(map);
-  
+
       const googleUrl = `https://www.google.com/maps?q=${p.lat},${p.lng}`;
-      const roleLine = p.role
-        ? `<div style="font-weight:600;margin-bottom:4px;">${p.role}</div>`
-        : "";
-      const popupHtml = `
+      let popupHtml;
+      if (twoPointMode) {
+        const roleLine = p.role
+          ? `<div style="font-weight:600;">${p.role}</div>`
+          : "";
+        const nameLine = spanName || p.name || "";
+        const nameBlock = nameLine
+          ? `<div style="margin-top:4px;">${nameLine}</div>`
+          : "";
+        popupHtml = `
+  <div>
+    ${roleLine}
+    ${nameBlock}
+    <div style="margin-top: 8px;">
+      <a href="${googleUrl}" target="_blank" rel="noopener noreferrer"
+         onclick="return confirm('Googleマップで開きますか？');">
+        Googleマップで開く
+      </a>
+    </div>
+  </div>
+`;
+        marker.bindPopup(popupHtml, { autoClose: false, closeOnClick: false });
+        twoPointMarkers.push(marker);
+      } else {
+        const roleLine = p.role
+          ? `<div style="font-weight:600;margin-bottom:4px;">${p.role}</div>`
+          : "";
+        popupHtml = `
   <div>
     ${roleLine}
     <div>${p.name}</div>
@@ -50,11 +77,12 @@
     </div>
   </div>
 `;
-  
-      marker.bindPopup(popupHtml);
+        marker.bindPopup(popupHtml);
+      }
+
       bounds.push([p.lat, p.lng]);
     });
-  
+
     if (bounds.length === 1) {
       map.setView(bounds[0], 18);
     } else {
@@ -62,6 +90,10 @@
         padding: [30, 30],
         maxZoom: 18
       });
+    }
+
+    if (twoPointMode && twoPointMarkers.length) {
+      twoPointMarkers.forEach(m => m.openPopup());
     }
   </script>
 </body>

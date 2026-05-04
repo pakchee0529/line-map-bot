@@ -816,15 +816,24 @@ def build_multi_map_url(points):
     return f"{BASE_URL}/multi-map?id={map_id}"
 
 
-def build_two_point_multi_map_url(p1_name: str, lat1: float, lng1: float, p2_name: str, lat2: float, lng2: float):
-    q = urllib.parse.urlencode(
-        {
-            "p1n": p1_name or "始点",
-            "p1": f"{lat1},{lng1}",
-            "p2n": p2_name or "終点",
-            "p2": f"{lat2},{lng2}",
-        }
-    )
+def build_two_point_multi_map_url(
+    p1_name: str,
+    lat1: float,
+    lng1: float,
+    p2_name: str,
+    lat2: float,
+    lng2: float,
+    span_display=None,
+):
+    params = {
+        "p1n": p1_name or "始点",
+        "p1": f"{lat1},{lng1}",
+        "p2n": p2_name or "終点",
+        "p2": f"{lat2},{lng2}",
+    }
+    if span_display:
+        params["sn"] = span_display
+    q = urllib.parse.urlencode(params)
     return f"{BASE_URL}/multi-map?{q}"
 
 
@@ -859,7 +868,13 @@ def compute_span_two_point_url(info: dict):
     lat2, lng2 = parsed2
 
     return build_two_point_multi_map_url(
-        info["front_key"], lat1, lng1, info["back_key"], lat2, lng2
+        info["front_key"],
+        lat1,
+        lng1,
+        info["back_key"],
+        lat2,
+        lng2,
+        span_display=info["display_name"] or None,
     )
 
 
@@ -1576,7 +1591,12 @@ def multi_map_view():
         if not valid_points:
             return "no valid points", 400
 
-        return render_template("multi_map.html", points=valid_points)
+        return render_template(
+            "multi_map.html",
+            points=valid_points,
+            two_point_mode=False,
+            span_name=None,
+        )
 
     p1 = request.args.get("p1")
     p2 = request.args.get("p2")
@@ -1594,7 +1614,13 @@ def multi_map_view():
             {"name": str(p1n), "lat": lat1, "lng": lng1, "role": "始点"},
             {"name": str(p2n), "lat": lat2, "lng": lng2, "role": "終点"},
         ]
-        return render_template("multi_map.html", points=valid_points)
+        span_name = request.args.get("sn") or ""
+        return render_template(
+            "multi_map.html",
+            points=valid_points,
+            two_point_mode=True,
+            span_name=span_name,
+        )
 
     return "missing id or p1/p2", 400
 
