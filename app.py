@@ -11,6 +11,7 @@ import uuid
 import time
 import secrets
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 
 import redis
 from dotenv import load_dotenv
@@ -132,17 +133,37 @@ def normalize_input_line(text: str) -> str:
     return remove_spaces(normalize_text(text.strip()))
 
 
-def extract_urls_from_reply(text: str):
+def extract_http_urls_from_text(text: str):
     if not text:
-        return text
+        return []
     urls = []
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("http://") or s.startswith("https://"):
             urls.append(s)
-    if not urls:
-        return text
-    return "\n".join(urls)
+    return urls
+
+
+@dataclass(frozen=True)
+class LineSearchReply:
+    """通常検索の LINE 返答下準備: プレーンテキストと URL 一覧を保持。URL のみモードは as_line_text で切替。"""
+
+    plain_text: str
+    urls: tuple[str, ...]
+
+    @classmethod
+    def from_plain_text(cls, plain_text: str):
+        pt = plain_text or ""
+        return cls(plain_text=pt, urls=tuple(extract_http_urls_from_text(pt)))
+
+    def as_line_text(self, url_only: bool) -> str:
+        if url_only and self.urls:
+            return "\n".join(self.urls)
+        return self.plain_text
+
+
+def extract_urls_from_reply(text: str):
+    return LineSearchReply.from_plain_text(text).as_line_text(url_only=True)
 
 
 def process_url_only_command(user_id, user_text):
@@ -1814,12 +1835,12 @@ def handle_text(event):
     threading.Thread(target=delayed_notice, daemon=True).start()
 
     try:
-        reply_text = process_text_logic(user_text)
+        search_reply = LineSearchReply.from_plain_text(process_text_logic(user_text))
     finally:
         done["flag"] = True
 
-    if user_id and is_url_only_mode(user_id):
-        reply_text = extract_urls_from_reply(reply_text)
+    url_only = bool(user_id and is_url_only_mode(user_id))
+    reply_text = search_reply.as_line_text(url_only=url_only)
 
     touch_user(user_data)
     reply_text_message(event.reply_token, reply_text)
