@@ -1,4 +1,4 @@
-from flask import Flask, request, abort, render_template, jsonify
+from flask import Flask, request, abort, render_template, jsonify, send_file
 import os
 import json
 import unicodedata
@@ -14,6 +14,7 @@ import sqlite3
 import gzip
 import shutil
 import hashlib
+from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,13 @@ import redis
 from dotenv import load_dotenv
 from cadastral_service import CadastralError, CadastralQueryError, CadastralStore
 from search_core import resolve_one as resolve_one_core
+from line_flex_builder import build_flex_payload
+from map_preview import (
+    parse_preview_points,
+    preview_bounds,
+    render_map_preview,
+    serialize_preview_points,
+)
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
@@ -32,7 +40,7 @@ from linebot.models import (
     LocationMessage,
     FollowEvent,
 )
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 
 app = Flask(__name__)
 
@@ -62,6 +70,8 @@ CADASTRAL_DATA_PATH = Path(
     )
 )
 CADASTRAL_MAX_FEATURES = int(os.getenv("CADASTRAL_MAX_FEATURES", "2500"))
+FLEX_REPLY_ENABLED = env_flag("LINE_FLEX_REPLY_ENABLED", True)
+MAP_PREVIEW_TILES_ENABLED = env_flag("MAP_PREVIEW_TILES_ENABLED", True)
 
 
 def ensure_bundled_cadastral_data() -> None:
@@ -216,63 +226,6 @@ class LineSearchReply:
 
 def extract_urls_from_reply(text: str):
     return LineSearchReply.from_plain_text(text).as_line_text(url_only=True)
-
-
-def _is_two_point_multi_map_query_url(url: str) -> bool:
-    if not url.startswith(("http://", "https://")):
-        return False
-    lo = url.lower()
-    if "multi-map" not in lo:
-        return False
-    return "p1=" in url and "p2=" in url
-
-
-def is_span_two_point_line_search_reply(search_reply: LineSearchReply) -> bool:
-    if len(search_reply.urls) != 1:
-        return False
-    url = search_reply.urls[0]
-    if not _is_two_point_multi_map_query_url(url):
-        return False
-    lines = search_reply.plain_text.splitlines()
-    if len(lines) < 2:
-        return False
-    if lines[0].strip().startswith(("http://", "https://")):
-        return False
-    if lines[1].strip() != url:
-        return False
-    return True
-
-
-def build_span_two_point_flex_message(search_reply: LineSearchReply):
-    if not is_span_two_point_line_search_reply(search_reply):
-        return None
-    url = search_reply.urls[0]
-    title = search_reply.plain_text.splitlines()[0].strip()
-    alt = (title or "2点地図")[:400]
-    contents = {
-        "type": "bubble",
-        "size": "kilo",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": title,
-                    "weight": "bold",
-                    "size": "lg",
-                    "wrap": True,
-                },
-                {
-                    "type": "button",
-                    "style": "link",
-                    "height": "sm",
-                    "action": {"type": "uri", "label": "2点地図を開く", "uri": url},
-                },
-            ],
-        },
-    }
-    return FlexSendMessage(alt_text=alt, contents=contents)
 
 
 def process_url_only_command(user_id, user_text):
@@ -1080,6 +1033,16 @@ def build_two_point_multi_map_url(
     return f"{BASE_URL}/multi-map?{q}"
 
 
+def build_map_preview_url(points, *, connect_points=False):
+    serialized = serialize_preview_points(points)
+    if not serialized or not BASE_URL.startswith("https://"):
+        return ""
+    params = {"points": serialized}
+    if connect_points:
+        params["connect"] = "1"
+    return f"{BASE_URL}/api/map-preview?{urllib.parse.urlencode(params)}"
+
+
 def resolve_span_endpoint_adopted(key: str):
     if not key:
         return None
@@ -1507,54 +1470,218 @@ def resolve_lines(text: str):
     return results
 
 
-def process_text_logic(user_text: str) -> str:
+def _result_points(result: dict) -> list[dict]:
+    points = []
+    span_points = result.get("span_points")
+    if isinstance(span_points, list) and span_points:
+        entries = span_points
+    else:
+        entries = [{"adopted": result.get("adopted"), "role": ""}]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        adopted = str(entry.get("adopted") or "")
+        latlon = POLE_COORDS.get(adopted)
+        parsed = parse_latlng(latlon) if latlon else None
+        if not parsed:
+            continue
+        points.append(
+            {
+                "display_name": adopted,
+                "lat": parsed[0],
+                "lng": parsed[1],
+                "role": str(entry.get("role") or ""),
+            }
+        )
+    return points
+
+
+def _card_for_result(result: dict) -> dict:
+    points = _result_points(result)
+    span_url = str(result.get("span_map_url") or "")
+    found = bool(result.get("found"))
+    candidate_notes = [
+        str(item) for item in result.get("candidate_notes") or [] if str(item)
+    ]
+    if not found:
+        status = "unresolved"
+    elif result.get("is_range") and len(result.get("span_points") or []) < 2:
+        status = "partial"
+    elif candidate_notes:
+        status = "corrected"
+    else:
+        status = "found"
+    if result.get("span_points"):
+        rows = [
+            {
+                "label": f"{str(item.get('role') or '')}番",
+                "value": str(item.get("adopted") or ""),
+            }
+            for item in result["span_points"][:2]
+            if isinstance(item, dict)
+        ]
+    elif result.get("adopted"):
+        rows = [{"label": "採用地点", "value": str(result["adopted"])}]
+    else:
+        rows = []
+    suggestions = result.get("suggestion_details")
+    suggestion_text = ""
+    if isinstance(suggestions, list) and suggestions:
+        first = suggestions[0]
+        if isinstance(first, dict):
+            suggestion_text = str(first.get("name") or "")
+    return {
+        "status": status,
+        "title": str(result.get("display_name") or ""),
+        "rows": rows,
+        "notes": candidate_notes,
+        "warnings": [
+            str(item) for item in result.get("warnings") or [] if str(item)
+        ],
+        "primary_url": span_url or str(result.get("url") or ""),
+        "primary_label": (
+            "2点地図・地番図を開く" if span_url else "Googleマップを開く"
+        ),
+        "secondary_url": str(result.get("url") or "") if span_url else "",
+        "secondary_label": "老番側をGoogleマップで開く",
+        "preview_url": build_map_preview_url(
+            points,
+            connect_points=bool(span_url),
+        ),
+        "suggestion_text": suggestion_text if not found else "",
+    }
+
+
+def build_search_response(user_text: str) -> dict:
     parsed = parse_latlng(user_text)
     if parsed:
         lat, lng = parsed
         nearby = find_nearby(lat, lng, 200)
         map_url = build_map_url(lat, lng)
         if nearby:
-            return format_location_result(map_url, len(nearby))
-        return format_location_empty(map_url)
+            plain_text = format_location_result(map_url, len(nearby))
+        else:
+            plain_text = format_location_empty(map_url)
+        return {
+            "plain_text": plain_text,
+            "cards": [
+                {
+                    "status": "nearby",
+                    "title": "半径200mの電柱",
+                    "rows": [{"label": "検索結果", "value": f"{len(nearby)}件"}],
+                    "primary_url": map_url,
+                    "primary_label": "周辺地図を開く",
+                    "preview_url": build_map_preview_url(
+                        [
+                            {"lat": lat, "lng": lng},
+                            *nearby[:19],
+                        ]
+                    ),
+                }
+            ],
+        }
 
     lines = split_input_lines(user_text)
     if not lines:
-        return "入力が空です"
+        return {"plain_text": "入力が空です", "cards": []}
 
     if len(lines) >= 2:
         results = resolve_lines(user_text)
-        points = extract_found_points(results)
+        points = [
+            point
+            for result in results
+            for point in _result_points(result)
+        ]
 
         multi_map_url = None
         if len(points) >= 2:
             multi_map_url = build_multi_map_url(points)
 
-        return format_resolve_results(
+        plain_text = format_resolve_results(
             results,
             include_single_map=False,
             multi_map_url=multi_map_url
         )
+        cards = [_card_for_result(result) for result in results]
+        if multi_map_url:
+            summary_card = {
+                "status": "summary",
+                "title": "検索結果をまとめて表示",
+                "rows": [
+                    {"label": "入力", "value": f"{len(results)}件"},
+                    {"label": "地図点", "value": f"{len(points)}件"},
+                ],
+                "primary_url": multi_map_url,
+                "primary_label": "まとめて地図を開く",
+                "preview_url": build_map_preview_url(points),
+            }
+            if len(cards) >= 12:
+                cards = cards[:11]
+            cards.append(summary_card)
+        return {"plain_text": plain_text, "cards": cards}
 
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
-        return format_resolve_results(results)
+        return {
+            "plain_text": format_resolve_results(results),
+            "cards": [_card_for_result(results[0])],
+        }
 
     place_points = find_place_points(user_text)
     if place_points:
         place_map_url = build_multi_map_url(place_points)
         if place_map_url:
-            return (
+            plain_text = (
                 f"{make_display_name(user_text)}の電柱を{len(place_points)}件見つけたよ\n"
                 f"{place_map_url}"
             )
+            return {
+                "plain_text": plain_text,
+                "cards": [
+                    {
+                        "status": "place",
+                        "title": make_display_name(user_text),
+                        "rows": [
+                            {
+                                "label": "登録電柱",
+                                "value": f"{len(place_points)}件",
+                            }
+                        ],
+                        "primary_url": place_map_url,
+                        "primary_label": "冠称名の地図を開く",
+                        "preview_url": build_map_preview_url(place_points[:20]),
+                    }
+                ],
+            }
 
     geo = geocode_address(user_text)
     if geo:
         lat, lng, address_name = geo
         map_url = build_map_url(lat, lng)
-        return format_address_result(address_name, map_url)
+        return {
+            "plain_text": format_address_result(address_name, map_url),
+            "cards": [
+                {
+                    "status": "found",
+                    "title": address_name,
+                    "rows": [{"label": "検索種別", "value": "住所検索"}],
+                    "primary_url": map_url,
+                    "primary_label": "周辺地図を開く",
+                    "preview_url": build_map_preview_url(
+                        [{"lat": lat, "lng": lng}]
+                    ),
+                }
+            ],
+        }
 
-    return format_resolve_results(results)
+    return {
+        "plain_text": format_resolve_results(results),
+        "cards": [_card_for_result(results[0])] if results else [],
+    }
+
+
+def process_text_logic(user_text: str) -> str:
+    return str(build_search_response(user_text).get("plain_text") or "")
 
 # ----------------------------
 # Management command handlers
@@ -1791,11 +1918,43 @@ def search_healthz():
     return jsonify(
         {
             "search_engine": SEARCH_ENGINE_VERSION,
+            "flex_reply_enabled": FLEX_REPLY_ENABLED,
+            "map_preview_tiles_enabled": MAP_PREVIEW_TILES_ENABLED,
             "revision": os.getenv("RENDER_GIT_COMMIT", "")[:12],
             "gps_count": len(POLE_COORDS),
             "gps_sha256": GPS_DATA_SHA256,
         }
     ), 200
+
+
+@app.route("/api/map-preview")
+def map_preview_image():
+    points = parse_preview_points(request.args.get("points"))
+    if not points:
+        return "valid points are required", 400
+    cadastral = None
+    if CADASTRAL_LAYER_ENABLED and CADASTRAL_STORE.available:
+        try:
+            bbox, zoom = preview_bounds(points)
+            cadastral = CADASTRAL_STORE.query(
+                bbox,
+                max(17, min(22, zoom)),
+            )
+        except (CadastralError, CadastralQueryError, sqlite3.Error, ValueError):
+            app.logger.warning("map preview cadastral overlay skipped")
+    try:
+        image = render_map_preview(
+            points,
+            use_tiles=MAP_PREVIEW_TILES_ENABLED,
+            cadastral=cadastral,
+            connect_points=request.args.get("connect") == "1",
+        )
+    except Exception:
+        app.logger.exception("map preview generation failed")
+        return "map preview generation failed", 503
+    response = send_file(BytesIO(image), mimetype="image/png")
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
 
 
 @app.route("/healthz/cadastral")
@@ -1972,14 +2131,30 @@ def reply_text_message(reply_token, text):
     line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
 
 
-def reply_search_message(reply_token, search_reply: LineSearchReply, url_only: bool):
+def reply_search_message(reply_token, search_response: dict, url_only: bool):
+    search_reply = LineSearchReply.from_plain_text(
+        str(search_response.get("plain_text") or "")
+    )
     if url_only:
         reply_text_message(reply_token, search_reply.as_line_text(url_only=True))
         return
-    flex_msg = build_span_two_point_flex_message(search_reply)
-    if flex_msg is not None:
-        line_bot_api.reply_message(reply_token, flex_msg)
-        return
+    flex_payload = build_flex_payload(search_response) if FLEX_REPLY_ENABLED else None
+    if flex_payload:
+        flex_message = FlexSendMessage(
+            alt_text=flex_payload["alt_text"],
+            contents=flex_payload["contents"],
+        )
+        try:
+            line_bot_api.reply_message(reply_token, flex_message)
+            return
+        except LineBotApiError as exc:
+            status_code = int(getattr(exc, "status_code", 0) or 0)
+            if not (400 <= status_code < 500 and status_code != 429):
+                raise
+            print(
+                "[line] flex reply rejected; retrying as text "
+                f"status={status_code}"
+            )
     reply_text_message(reply_token, search_reply.as_line_text(url_only=False))
 
 
@@ -2072,14 +2247,14 @@ def handle_text(event):
     threading.Thread(target=delayed_notice, daemon=True).start()
 
     try:
-        search_reply = LineSearchReply.from_plain_text(process_text_logic(user_text))
+        search_response = build_search_response(user_text)
     finally:
         done["flag"] = True
 
     url_only = bool(user_id and is_url_only_mode(user_id))
 
     touch_user(user_data)
-    reply_search_message(event.reply_token, search_reply, url_only)
+    reply_search_message(event.reply_token, search_response, url_only)
 
 
 @handler.add(MessageEvent, message=LocationMessage)
@@ -2110,9 +2285,31 @@ def handle_location(event):
         reply_text = format_location_result(map_url, len(nearby), header=header)
     else:
         reply_text = format_location_empty(map_url, header=header)
+    search_response = {
+        "plain_text": reply_text,
+        "cards": [
+            {
+                "status": "nearby",
+                "title": title,
+                "rows": [
+                    {"label": "検索結果", "value": f"{len(nearby)}件"},
+                    *(
+                        [{"label": "住所", "value": address}]
+                        if address
+                        else []
+                    ),
+                ],
+                "primary_url": map_url,
+                "primary_label": "周辺地図を開く",
+                "preview_url": build_map_preview_url(
+                    [{"lat": lat, "lng": lng}, *nearby[:19]]
+                ),
+            }
+        ],
+    }
 
     touch_user(user_data)
-    reply_text_message(event.reply_token, reply_text)
+    reply_search_message(event.reply_token, search_response, url_only=False)
 
 
 if __name__ == "__main__":

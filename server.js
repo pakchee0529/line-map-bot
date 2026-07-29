@@ -18,6 +18,13 @@ const {
   CadastralStore,
   ensureBundledDatabase,
 } = require('./node_cadastral_store');
+const { buildFlexMessage } = require('./line_flex_builder');
+const {
+  parsePreviewPoints,
+  previewBounds,
+  renderMapPreview,
+  serializePreviewPoints,
+} = require('./map_preview_service');
 
 const ROOT = __dirname;
 const PORT = Number(process.env.PORT || 3000);
@@ -25,6 +32,12 @@ const BASE_URL = String(process.env.BASE_URL || 'https://line-map-bot.onrender.c
   .replace(/\/+$/, '');
 const SEARCH_ENGINE_VERSION = 'node-pc-core-v2';
 const MULTI_MAP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const FLEX_REPLY_ENABLED = String(
+  process.env.LINE_FLEX_REPLY_ENABLED ?? 'true',
+).toLowerCase() !== 'false';
+const MAP_PREVIEW_TILES_ENABLED = String(
+  process.env.MAP_PREVIEW_TILES_ENABLED ?? 'true',
+).toLowerCase() !== 'false';
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',
@@ -134,6 +147,14 @@ function storeMultiMap(points) {
   return `${BASE_URL}/multi-map?id=${id}`;
 }
 
+function mapPreviewUrl(points, { connectPoints = false } = {}) {
+  const serialized = serializePreviewPoints(points);
+  if (!serialized) return '';
+  const params = new URLSearchParams({ points: serialized });
+  if (connectPoints) params.set('connect', '1');
+  return `${BASE_URL}/api/map-preview?${params}`;
+}
+
 function uniquePoints(results) {
   const output = [];
   const seen = new Set();
@@ -151,6 +172,13 @@ function uniquePoints(results) {
     }
   }
   return output;
+}
+
+function resultPoints(result) {
+  const names = result.spanPoints.length
+    ? result.spanPoints.map((item) => item.adopted)
+    : [result.adopted];
+  return names.map(coordinatesFor).filter(Boolean);
 }
 
 function formatResult(result) {
@@ -177,50 +205,162 @@ function formatResult(result) {
   return lines.join('\n');
 }
 
-function buildSearchReply(rawText) {
+function cardForSearchResult(result) {
+  const points = resultPoints(result);
+  const spanUrl = twoPointMapUrl(result);
+  const primaryPoint = points[points.length - 1] || null;
+  let status = 'found';
+  if (!result.found) {
+    status = 'unresolved';
+  } else if (result.isRange && result.spanPoints.length < 2) {
+    status = 'partial';
+  } else if (result.candidateNotes.length) {
+    status = 'corrected';
+  }
+  const rows = result.spanPoints.length
+    ? result.spanPoints.map((item) => ({
+      label: `${item.role}番`,
+      value: item.adopted,
+    }))
+    : (result.adopted ? [{ label: '採用地点', value: result.adopted }] : []);
+  return {
+    status,
+    title: result.displayName,
+    rows,
+    notes: result.candidateNotes,
+    warnings: result.warnings,
+    primaryUrl: spanUrl || (primaryPoint ? googleMapsUrl(primaryPoint) : ''),
+    primaryLabel: spanUrl ? '2点地図・地番図を開く' : 'Googleマップを開く',
+    secondaryUrl: spanUrl && primaryPoint ? googleMapsUrl(primaryPoint) : '',
+    secondaryLabel: '老番側をGoogleマップで開く',
+    previewUrl: points.length
+      ? mapPreviewUrl(points, { connectPoints: Boolean(spanUrl) })
+      : '',
+    suggestionText: !result.found && result.suggestionDetails.length
+      ? result.suggestionDetails[0].name
+      : '',
+  };
+}
+
+function buildSearchResponse(rawText) {
   const lines = splitInputLines(rawText);
-  if (!lines.length) return '電柱名または径間名を入力してください。';
+  if (!lines.length) {
+    return {
+      plainText: '電柱名または径間名を入力してください。',
+      cards: [],
+    };
+  }
 
   if (lines.length === 1) {
     const latLng = parseLatLng(lines[0]);
     if (latLng) {
       const nearby = findNearby(latLng.lat, latLng.lng);
-      return `周辺200mの電柱: ${nearby.length}件\n`
-        + `${BASE_URL}/map?lat=${latLng.lat}&lng=${latLng.lng}`;
+      const mapUrl = `${BASE_URL}/map?lat=${latLng.lat}&lng=${latLng.lng}`;
+      const plainText = `周辺200mの電柱: ${nearby.length}件\n${mapUrl}`;
+      return {
+        plainText,
+        cards: [{
+          status: 'nearby',
+          title: '半径200mの電柱',
+          rows: [{ label: '検索結果', value: `${nearby.length}件` }],
+          primaryUrl: mapUrl,
+          primaryLabel: '周辺地図を開く',
+          previewUrl: mapPreviewUrl([{ lat: latLng.lat, lng: latLng.lng }, ...nearby]),
+        }],
+      };
     }
 
     const parsed = parsePoleName(lines[0]);
     if (!parsed) {
       const placePoints = findPlacePoints(lines[0], gpsPoints);
       if (placePoints.length) {
-        return `${lines[0]}: ${placePoints.length}件\n${storeMultiMap(placePoints)}`;
+        const mapUrl = storeMultiMap(placePoints);
+        const plainText = `${lines[0]}: ${placePoints.length}件\n${mapUrl}`;
+        return {
+          plainText,
+          cards: [{
+            status: 'place',
+            title: lines[0],
+            rows: [{ label: '登録電柱', value: `${placePoints.length}件` }],
+            primaryUrl: mapUrl,
+            primaryLabel: '冠称名の地図を開く',
+            previewUrl: mapPreviewUrl(placePoints),
+          }],
+        };
       }
     }
   }
 
   const results = lines.map((input) => resolveOne(input, poleCoords));
   const blocks = results.map(formatResult);
+  const cards = results.map(cardForSearchResult);
   if (results.length > 1) {
     const points = uniquePoints(results);
-    if (points.length) blocks.push(`まとめて地図: ${storeMultiMap(points)}`);
+    if (points.length) {
+      const mapUrl = storeMultiMap(points);
+      blocks.push(`まとめて地図: ${mapUrl}`);
+      const summaryCard = {
+        status: 'summary',
+        title: '検索結果をまとめて表示',
+        rows: [
+          { label: '入力', value: `${results.length}件` },
+          { label: '地図点', value: `${points.length}件` },
+        ],
+        primaryUrl: mapUrl,
+        primaryLabel: 'まとめて地図を開く',
+        previewUrl: mapPreviewUrl(points),
+      };
+      if (cards.length >= 12) cards.splice(11);
+      cards.push(summaryCard);
+    }
   }
-  return blocks.join('\n\n');
+  return {
+    plainText: blocks.join('\n\n'),
+    cards,
+  };
+}
+
+function buildSearchReply(rawText) {
+  return buildSearchResponse(rawText).plainText;
 }
 
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return null;
   if (!client) throw new Error('LINE_CHANNEL_ACCESS_TOKEN is not configured');
-  let replyText;
+  let response;
   try {
-    replyText = buildSearchReply(event.message.text || '');
+    response = buildSearchResponse(event.message.text || '');
   } catch (error) {
     console.error('[search] reply generation failed', error);
-    replyText = '検索中にエラーが発生しました。入力を確認してもう一度お試しください。';
+    response = {
+      plainText: '検索中にエラーが発生しました。入力を確認してもう一度お試しください。',
+      cards: [],
+    };
   }
-  return client.replyMessage({
-    replyToken: event.replyToken,
-    messages: [{ type: 'text', text: replyText.slice(0, 5000) }],
-  });
+
+  const textMessage = {
+    type: 'text',
+    text: response.plainText.slice(0, 5000),
+  };
+  const flexMessage = FLEX_REPLY_ENABLED ? buildFlexMessage(response) : null;
+  if (!flexMessage) {
+    return client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [textMessage],
+    });
+  }
+  try {
+    return await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [flexMessage],
+    });
+  } catch (error) {
+    console.error('[line] flex reply failed; retrying as text', error);
+    return client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [textMessage],
+    });
+  }
 }
 
 const webhookMiddleware = config.channelSecret
@@ -244,6 +384,8 @@ app.get('/healthz', (_req, res) => {
 app.get('/healthz/search', (_req, res) => {
   res.json({
     search_engine: SEARCH_ENGINE_VERSION,
+    flex_reply_enabled: FLEX_REPLY_ENABLED,
+    map_preview_tiles_enabled: MAP_PREVIEW_TILES_ENABLED,
     revision: String(process.env.RENDER_GIT_COMMIT || '').slice(0, 12),
     gps_count: poleCoords.size,
     gps_sha256: gpsSha256,
@@ -275,6 +417,38 @@ app.get('/healthz/cadastral', (_req, res) => {
     payload.available = false;
   }
   res.status(cadastralEnabled && !payload.available ? 503 : 200).json(payload);
+});
+
+app.get('/api/map-preview', async (req, res) => {
+  const points = parsePreviewPoints(req.query.points);
+  if (!points.length) {
+    return res.status(400).send('valid points are required');
+  }
+  try {
+    let cadastral = null;
+    if (cadastralEnabled && cadastralStore.available) {
+      try {
+        const viewport = previewBounds(points);
+        cadastral = cadastralStore.query(
+          viewport.bbox,
+          Math.max(17, Math.min(22, viewport.zoom)),
+        );
+      } catch (error) {
+        console.warn('[map-preview] cadastral overlay skipped', error.message);
+      }
+    }
+    const image = await renderMapPreview(points, {
+      useTiles: MAP_PREVIEW_TILES_ENABLED,
+      cadastral,
+      connectPoints: String(req.query.connect || '') === '1',
+    });
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.send(image);
+  } catch (error) {
+    console.error('[map-preview] generation failed', error);
+    return res.status(503).send('map preview generation failed');
+  }
 });
 
 app.get('/api/cadastral/features', (req, res) => {
@@ -362,6 +536,7 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  buildSearchResponse,
   buildSearchReply,
   cadastralStore,
   poleCoords,
