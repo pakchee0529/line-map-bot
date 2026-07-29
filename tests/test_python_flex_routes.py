@@ -7,13 +7,16 @@ class PythonFlexRoutesTest(unittest.TestCase):
     def setUp(self):
         self.original_base_url = app_module.BASE_URL
         self.original_tiles = app_module.MAP_PREVIEW_TILES_ENABLED
+        self.original_tile_source = app_module.MAP_PREVIEW_TILE_SOURCE
         app_module.BASE_URL = "https://line-map-bot-ouvo.onrender.com"
         app_module.MAP_PREVIEW_TILES_ENABLED = False
+        app_module.MAP_PREVIEW_TILE_SOURCE = "gsi_aerial"
         self.client = app_module.app.test_client()
 
     def tearDown(self):
         app_module.BASE_URL = self.original_base_url
         app_module.MAP_PREVIEW_TILES_ENABLED = self.original_tiles
+        app_module.MAP_PREVIEW_TILE_SOURCE = self.original_tile_source
 
     def test_two_point_search_builds_flex_ready_card(self):
         response = app_module.build_search_response(
@@ -45,6 +48,7 @@ class PythonFlexRoutesTest(unittest.TestCase):
         payload = response.get_json()
         self.assertIn("flex_reply_enabled", payload)
         self.assertIn("map_preview_tiles_enabled", payload)
+        self.assertEqual(payload["map_preview_tile_source"], "gsi_aerial")
 
 
 if __name__ == "__main__":

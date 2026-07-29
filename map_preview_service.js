@@ -7,6 +7,9 @@ const HEIGHT = 512;
 const TILE_SIZE = 256;
 const MAX_POINTS = 20;
 const MAX_CACHE_ENTRIES = 100;
+const TILE_SOURCE_GSI_AERIAL = 'gsi_aerial';
+const TILE_SOURCE_OSM = 'osm';
+const DEFAULT_TILE_SOURCE = TILE_SOURCE_GSI_AERIAL;
 const cache = new Map();
 
 function parsePreviewPoints(raw) {
@@ -102,20 +105,27 @@ function wrapTileX(x, zoom) {
   return ((x % count) + count) % count;
 }
 
-async function fetchTile(zoom, x, y) {
+function normalizeTileSource(value) {
+  return String(value || '').trim().toLowerCase() === TILE_SOURCE_OSM
+    ? TILE_SOURCE_OSM
+    : TILE_SOURCE_GSI_AERIAL;
+}
+
+async function fetchTile(zoom, x, y, tileSource) {
   if (y < 0 || y >= 2 ** zoom) return null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
+  const tileX = wrapTileX(x, zoom);
+  const url = tileSource === TILE_SOURCE_OSM
+    ? `https://tile.openstreetmap.org/${zoom}/${tileX}/${y}.png`
+    : `https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/${zoom}/${tileX}/${y}.jpg`;
   try {
-    const response = await fetch(
-      `https://tile.openstreetmap.org/${zoom}/${wrapTileX(x, zoom)}/${y}.png`,
-      {
-        headers: {
-          'User-Agent': 'line-map-bot/1.0 (LINE field map preview)',
-        },
-        signal: controller.signal,
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'line-map-bot/1.0 (LINE field map preview)',
       },
-    );
+      signal: controller.signal,
+    });
     if (!response.ok) return null;
     return Buffer.from(await response.arrayBuffer());
   } catch (_error) {
@@ -125,7 +135,12 @@ async function fetchTile(zoom, x, y) {
   }
 }
 
-function overlaySvg(screenPoints, hasCadastral, connectPoints) {
+function overlaySvg(
+  screenPoints,
+  hasCadastral,
+  connectPoints,
+  renderedTileSource,
+) {
   const line = connectPoints && screenPoints.length === 2
     ? `<polyline points="${screenPoints.map((p) => `${p.x},${p.y}`).join(' ')}"
          fill="none" stroke="#173B67" stroke-width="8"
@@ -149,6 +164,15 @@ function overlaySvg(screenPoints, hasCadastral, connectPoints) {
           stroke-width="${screenPoints.length === 1 ? 7 : 4}"/>
       </g>
     `).join('');
+  let attribution = '';
+  if (renderedTileSource === TILE_SOURCE_GSI_AERIAL) {
+    attribution = 'Source: GSI Japan aerial imagery';
+  } else if (renderedTileSource === TILE_SOURCE_OSM) {
+    attribution = '© OpenStreetMap contributors';
+  }
+  if (hasCadastral) {
+    attribution += `${attribution ? ' / ' : ''}Cadastral: Gojo City CC BY 4.0`;
+  }
   return Buffer.from(`
     <svg width="${WIDTH}" height="${HEIGHT}" xmlns="http://www.w3.org/2000/svg">
       <rect width="100%" height="100%" fill="none"/>
@@ -158,7 +182,7 @@ function overlaySvg(screenPoints, hasCadastral, connectPoints) {
         fill="#FFFFFF" fill-opacity="0.82"/>
       <text x="${WIDTH - 12}" y="${HEIGHT - 9}" text-anchor="end"
         font-family="Arial, sans-serif" font-size="16" fill="#334155">
-        © OpenStreetMap contributors${hasCadastral ? ' / Cadastral: Gojo City CC BY 4.0' : ''}
+        ${attribution}
       </text>
     </svg>
   `);
@@ -170,6 +194,46 @@ function escapeXml(value) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function nearbyCadastralLabelKeys(features, geometry, maxDistance = 180) {
+  const project = (coordinate) => {
+    const point = worldPoint({
+      lng: Number(coordinate[0]),
+      lat: Number(coordinate[1]),
+    }, geometry.zoom);
+    return {
+      x: point.x - geometry.left,
+      y: point.y - geometry.top,
+    };
+  };
+  const candidates = features
+    .map((feature, index) => ({ feature, index }))
+    .filter(({ feature }) => (
+      feature.properties?.layer === 'label'
+      && feature.geometry?.type === 'Point'
+    ))
+    .map(({ feature, index }) => ({
+      key: String(feature.id ?? `label-${index}`),
+      point: project(feature.geometry.coordinates),
+    }));
+  const selected = new Set();
+  const maxDistanceSquared = maxDistance ** 2;
+  for (const screenPoint of geometry.screenPoints.slice(0, 2)) {
+    const nearest = [...candidates].sort((left, right) => (
+      ((left.point.x - screenPoint.x) ** 2 + (left.point.y - screenPoint.y) ** 2)
+      - ((right.point.x - screenPoint.x) ** 2 + (right.point.y - screenPoint.y) ** 2)
+    ));
+    for (const candidate of nearest) {
+      const distanceSquared = (candidate.point.x - screenPoint.x) ** 2
+        + (candidate.point.y - screenPoint.y) ** 2;
+      if (distanceSquared > maxDistanceSquared) break;
+      if (selected.has(candidate.key)) continue;
+      selected.add(candidate.key);
+      break;
+    }
+  }
+  return selected;
 }
 
 function cadastralOverlaySvg(featureCollection, geometry) {
@@ -192,23 +256,26 @@ function cadastralOverlaySvg(featureCollection, geometry) {
     if (!projected.length) return '';
     return `M ${projected.map((point) => `${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(' L ')}${close ? ' Z' : ''}`;
   };
+  const selectedLabelKeys = nearbyCadastralLabelKeys(features, geometry);
 
   const shapes = [];
   const labels = [];
-  for (const feature of features) {
+  features.forEach((feature, index) => {
     const layer = feature.properties && feature.properties.layer;
     const geometryValue = feature.geometry || {};
     if (layer === 'label' && geometryValue.type === 'Point') {
+      const key = String(feature.id ?? `label-${index}`);
+      if (!selectedLabelKeys.has(key)) return;
       const point = project(geometryValue.coordinates);
       const angle = Number(feature.properties.angle) || 0;
       labels.push(`
         <text x="${point.x}" y="${point.y}" text-anchor="middle"
           transform="rotate(${angle} ${point.x} ${point.y})"
-          font-family="Arial, sans-serif" font-size="13"
+          font-family="Arial, sans-serif" font-size="16" font-weight="700"
           fill="#8A2D0A" stroke="#FFFFFF" stroke-width="3"
           paint-order="stroke">${escapeXml(feature.properties.label)}</text>
       `);
-      continue;
+      return;
     }
 
     const paths = [];
@@ -224,15 +291,15 @@ function cadastralOverlaySvg(featureCollection, geometry) {
       for (const line of geometryValue.coordinates || []) paths.push(pathForLine(line));
     }
     const pathData = paths.filter(Boolean).join(' ');
-    if (!pathData) continue;
+    if (!pathData) return;
     const leader = layer === 'leader';
     shapes.push(`
-      <path d="${pathData}" fill="${leader ? 'none' : '#FDBA74'}"
-        fill-opacity="${leader ? '0' : '0.08'}"
-        stroke="${leader ? '#9A3412' : '#C2410C'}"
-        stroke-width="${leader ? '2' : '2.4'}" stroke-opacity="0.92"/>
+      <path d="${pathData}" fill="none"
+        stroke="${leader ? '#9A3412' : '#F97316'}"
+        stroke-width="${leader ? '1' : '2'}"
+        stroke-opacity="${leader ? '0.45' : '0.53'}"/>
     `);
-  }
+  });
 
   return Buffer.from(`
     <svg width="${WIDTH}" height="${HEIGHT}" xmlns="http://www.w3.org/2000/svg">
@@ -242,10 +309,46 @@ function cadastralOverlaySvg(featureCollection, geometry) {
   `);
 }
 
+async function tileComposites(geometry, tileSource) {
+  const minTileX = Math.floor(geometry.left / TILE_SIZE);
+  const maxTileX = Math.floor((geometry.left + WIDTH) / TILE_SIZE);
+  const minTileY = Math.floor(geometry.top / TILE_SIZE);
+  const maxTileY = Math.floor((geometry.top + HEIGHT) / TILE_SIZE);
+  const jobs = [];
+  for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
+    for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
+      jobs.push((async () => {
+        const tile = await fetchTile(geometry.zoom, tileX, tileY, tileSource);
+        if (!tile) return null;
+        const rawLeft = Math.round(tileX * TILE_SIZE - geometry.left);
+        const rawTop = Math.round(tileY * TILE_SIZE - geometry.top);
+        const cropLeft = Math.max(0, -rawLeft);
+        const cropTop = Math.max(0, -rawTop);
+        const left = Math.max(0, rawLeft);
+        const top = Math.max(0, rawTop);
+        const width = Math.min(TILE_SIZE - cropLeft, WIDTH - left);
+        const height = Math.min(TILE_SIZE - cropTop, HEIGHT - top);
+        if (width <= 0 || height <= 0) return null;
+        const input = (cropLeft || cropTop || width < TILE_SIZE || height < TILE_SIZE)
+          ? await sharp(tile).extract({
+            left: cropLeft,
+            top: cropTop,
+            width,
+            height,
+          }).toBuffer()
+          : tile;
+        return { input, left, top };
+      })());
+    }
+  }
+  return (await Promise.all(jobs)).filter(Boolean);
+}
+
 async function renderMapPreview(points, {
   useTiles = true,
   cadastral = null,
   connectPoints = false,
+  tileSource = DEFAULT_TILE_SOURCE,
 } = {}) {
   if (!Array.isArray(points) || !points.length) {
     throw new RangeError('at least one valid point is required');
@@ -256,7 +359,8 @@ async function renderMapPreview(points, {
   const cadastralVersion = cadastralFeatures.length
     ? `${cadastralFeatures.length}:${String(cadastral.metadata?.source_date || '')}`
     : 'none';
-  const cacheKey = `${useTiles ? 'tiles' : 'plain'}:${connectPoints ? 'line' : 'pins'}:${serializePreviewPoints(points)}:${cadastralVersion}`;
+  const requestedTileSource = normalizeTileSource(tileSource);
+  const cacheKey = `${useTiles ? requestedTileSource : 'plain'}:${connectPoints ? 'line' : 'pins'}:${serializePreviewPoints(points)}:${cadastralVersion}`;
   if (cache.has(cacheKey)) return cache.get(cacheKey);
 
   const geometry = previewGeometry(points);
@@ -269,44 +373,17 @@ async function renderMapPreview(points, {
     },
   });
   const composites = [];
+  let renderedTileSource = '';
 
   if (useTiles) {
-    const minTileX = Math.floor(geometry.left / TILE_SIZE);
-    const maxTileX = Math.floor((geometry.left + WIDTH) / TILE_SIZE);
-    const minTileY = Math.floor(geometry.top / TILE_SIZE);
-    const maxTileY = Math.floor((geometry.top + HEIGHT) / TILE_SIZE);
-    const jobs = [];
-    for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
-      for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
-        jobs.push((async () => {
-          const tile = await fetchTile(geometry.zoom, tileX, tileY);
-          if (!tile) return null;
-          const rawLeft = Math.round(tileX * TILE_SIZE - geometry.left);
-          const rawTop = Math.round(tileY * TILE_SIZE - geometry.top);
-          const cropLeft = Math.max(0, -rawLeft);
-          const cropTop = Math.max(0, -rawTop);
-          const left = Math.max(0, rawLeft);
-          const top = Math.max(0, rawTop);
-          const width = Math.min(TILE_SIZE - cropLeft, WIDTH - left);
-          const height = Math.min(TILE_SIZE - cropTop, HEIGHT - top);
-          if (width <= 0 || height <= 0) return null;
-          const input = (cropLeft || cropTop || width < TILE_SIZE || height < TILE_SIZE)
-            ? await sharp(tile).extract({
-              left: cropLeft,
-              top: cropTop,
-              width,
-              height,
-            }).toBuffer()
-            : tile;
-          return {
-            input,
-            left,
-            top,
-          };
-        })());
-      }
+    let tileLayers = await tileComposites(geometry, requestedTileSource);
+    if (tileLayers.length) {
+      renderedTileSource = requestedTileSource;
+    } else if (requestedTileSource !== TILE_SOURCE_OSM) {
+      tileLayers = await tileComposites(geometry, TILE_SOURCE_OSM);
+      if (tileLayers.length) renderedTileSource = TILE_SOURCE_OSM;
     }
-    composites.push(...(await Promise.all(jobs)).filter(Boolean));
+    composites.push(...tileLayers);
   }
 
   const cadastralOverlay = cadastralOverlaySvg(cadastral, geometry);
@@ -318,6 +395,7 @@ async function renderMapPreview(points, {
       geometry.screenPoints,
       cadastralFeatures.length > 0,
       connectPoints,
+      renderedTileSource,
     ),
     left: 0,
     top: 0,
@@ -335,9 +413,15 @@ async function renderMapPreview(points, {
 }
 
 module.exports = {
+  DEFAULT_TILE_SOURCE,
   HEIGHT,
+  TILE_SOURCE_GSI_AERIAL,
+  TILE_SOURCE_OSM,
   WIDTH,
+  nearbyCadastralLabelKeys,
+  normalizeTileSource,
   parsePreviewPoints,
+  previewGeometry,
   previewBounds,
   renderMapPreview,
   serializePreviewPoints,

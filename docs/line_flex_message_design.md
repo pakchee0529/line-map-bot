@@ -70,13 +70,15 @@ Flexが無効、カードがない、またはLINE送信でFlexが拒否され�
 `GET /api/map-preview?points=lat,lng|lat,lng...` が1024x512 PNGを返す。
 Python本番系はPillow、Node互換系はSharpで生成する。
 
-- OpenStreetMapタイルを表示範囲だけ取得して合成
+- 標準背景は国土地理院「全国最新写真（シームレス）」の航空写真
+- 航空写真を取得できない場合だけOpenStreetMapへフォールバック
 - 確定した2点径間だけ、若番を1、老番を2としてピン内に表示して線で接続
 - 冠称名、周辺200m、複数行は独立ピンとし、推測線を生成しない
-- 五條市地番図の範囲内では境界、地番、引出線を重ねる
-- OpenStreetMapおよび五條市地番図の帰属表示を画像内に付ける
+- 五條市地番図の境界は塗りつぶさず、細い半透明線で重ねる
+- 地番数字は全件を描画せず、若番・老番の各地点に最も近いものを最大2件だけ表示
+- 実際に表示した背景と五條市地番図の帰属表示を画像内に付ける
 - 同じ地点の完成画像をプロセス内で最大100件キャッシュ
-- タイル取得失敗時も背景、ピン、線を含むPNGを生成
+- 全タイル取得失敗時も背景、ピン、線を含むPNGを生成
 
 画像URLには座標だけを含め、利用者ID、LINEトークン、管理番号などは含めない。
 
@@ -85,12 +87,15 @@ Python本番系はPillow、Node互換系はSharpで生成する。
 ```text
 LINE_FLEX_REPLY_ENABLED=true
 MAP_PREVIEW_TILES_ENABLED=true
+MAP_PREVIEW_TILE_SOURCE=gsi_aerial
 ```
 
 - `LINE_FLEX_REPLY_ENABLED=false`: 従来テキスト返信へ即時復帰
 - `MAP_PREVIEW_TILES_ENABLED=false`: 外部タイルなしの簡易PNGへ切替
+- `MAP_PREVIEW_TILE_SOURCE=osm`: 航空写真を使わず従来地図へ切替
 
-どちらも未設定時は有効。現在値は `/healthz/search` で秘密値なしに確認できる。
+未設定時はFlex・外部タイルを有効にし、背景は航空写真とする。
+現在値は `/healthz/search` で秘密値なしに確認できる。
 
 ## 7. 安全条件
 
@@ -107,6 +112,8 @@ MAP_PREVIEW_TILES_ENABLED=true
 - 12バブル上限
 - HTTPS以外のアクション除外
 - タイルなしPNG
+- 航空写真PNGとOpenStreetMapフォールバック
 - 地番図重畳PNG
+- 地番数字が最大2件に制限されること
 - `/map`, `/multi-map`, `/api/map-preview`
 - `/healthz/search` の表示スイッチ

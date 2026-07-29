@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import math
 import threading
@@ -14,6 +15,9 @@ HEIGHT = 512
 TILE_SIZE = 256
 MAX_POINTS = 20
 MAX_CACHE_ENTRIES = 100
+TILE_SOURCE_GSI_AERIAL = "gsi_aerial"
+TILE_SOURCE_OSM = "osm"
+DEFAULT_TILE_SOURCE = TILE_SOURCE_GSI_AERIAL
 
 _cache: OrderedDict[str, bytes] = OrderedDict()
 _cache_lock = threading.Lock()
@@ -123,13 +127,32 @@ def _font(size: int):
     return ImageFont.load_default()
 
 
-def _fetch_tile(zoom: int, x: int, y: int) -> Image.Image | None:
+def normalize_tile_source(value: object) -> str:
+    source = str(value or "").strip().lower()
+    if source == TILE_SOURCE_OSM:
+        return TILE_SOURCE_OSM
+    return TILE_SOURCE_GSI_AERIAL
+
+
+def _fetch_tile(
+    zoom: int,
+    x: int,
+    y: int,
+    tile_source: str,
+) -> Image.Image | None:
     tile_count = 2**zoom
     if y < 0 or y >= tile_count:
         return None
     wrapped_x = x % tile_count
+    if tile_source == TILE_SOURCE_OSM:
+        url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
+    else:
+        url = (
+            "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/"
+            f"{zoom}/{wrapped_x}/{y}.jpg"
+        )
     request = urllib.request.Request(
-        f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png",
+        url,
         headers={"User-Agent": "line-map-bot/1.0 (LINE field map preview)"},
     )
     try:
@@ -145,13 +168,68 @@ def _project_coordinate(coordinate, geometry: dict) -> tuple[float, float]:
     return x - geometry["left"], y - geometry["top"]
 
 
-def _draw_cadastral(
-    draw: ImageDraw.ImageDraw,
+def _nearby_label_features(
     cadastral: dict | None,
     geometry: dict,
+    screen_points: list[tuple[float, float]],
+    *,
+    max_distance: float = 180,
+) -> list[dict]:
+    labels = [
+        feature
+        for feature in list((cadastral or {}).get("features") or [])
+        if (feature.get("properties") or {}).get("layer") == "label"
+        and (feature.get("geometry") or {}).get("type") == "Point"
+    ]
+    candidates = []
+    for feature in labels:
+        coordinate = (feature.get("geometry") or {}).get("coordinates") or []
+        if len(coordinate) < 2:
+            continue
+        x, y = _project_coordinate(coordinate, geometry)
+        candidates.append((feature, x, y))
+
+    selected = []
+    selected_ids = set()
+    max_distance_squared = max_distance**2
+    for point_x, point_y in screen_points[:2]:
+        nearest = sorted(
+            candidates,
+            key=lambda item: (item[1] - point_x) ** 2 + (item[2] - point_y) ** 2,
+        )
+        for feature, label_x, label_y in nearest:
+            feature_id = str(feature.get("id") or id(feature))
+            distance_squared = (label_x - point_x) ** 2 + (label_y - point_y) ** 2
+            if distance_squared > max_distance_squared:
+                break
+            if feature_id in selected_ids:
+                continue
+            selected.append(feature)
+            selected_ids.add(feature_id)
+            break
+    return selected
+
+
+def _draw_cadastral(
+    image: Image.Image,
+    cadastral: dict | None,
+    geometry: dict,
+    screen_points: list[tuple[float, float]],
 ) -> int:
     features = list((cadastral or {}).get("features") or [])
-    label_font = _font(13)
+    if not features:
+        return 0
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    label_font = _font(16)
+    selected_labels = {
+        str(feature.get("id") or id(feature))
+        for feature in _nearby_label_features(
+            cadastral,
+            geometry,
+            screen_points,
+        )
+    }
 
     def draw_line(coordinates, *, fill, width, closed=False):
         points = [_project_coordinate(coordinate, geometry) for coordinate in coordinates]
@@ -168,21 +246,23 @@ def _draw_cadastral(
         geometry_type = geometry_value.get("type")
         coordinates = geometry_value.get("coordinates") or []
         if layer == "label" and geometry_type == "Point":
+            if str(feature.get("id") or id(feature)) not in selected_labels:
+                continue
             point = _project_coordinate(coordinates, geometry)
             label = str(properties.get("label") or "")
             if label:
                 draw.text(
                     point,
                     label,
-                    fill="#8A2D0A",
+                    fill=(138, 45, 10, 235),
                     font=label_font,
                     anchor="mm",
-                    stroke_width=2,
-                    stroke_fill="white",
+                    stroke_width=3,
+                    stroke_fill=(255, 255, 255, 235),
                 )
             continue
-        color = "#9A3412" if layer == "leader" else "#C2410C"
-        width = 2
+        color = (154, 52, 18, 115) if layer == "leader" else (249, 115, 22, 135)
+        width = 1 if layer == "leader" else 2
         if geometry_type == "Polygon":
             for ring in coordinates:
                 draw_line(ring, fill=color, width=width, closed=True)
@@ -195,7 +275,44 @@ def _draw_cadastral(
         elif geometry_type == "MultiLineString":
             for line in coordinates:
                 draw_line(line, fill=color, width=width)
+    image.alpha_composite(overlay)
     return len(features)
+
+
+def _paste_tiles(
+    image: Image.Image,
+    geometry: dict,
+    tile_source: str,
+) -> int:
+    loaded = 0
+    min_tile_x = math.floor(geometry["left"] / TILE_SIZE)
+    max_tile_x = math.floor((geometry["left"] + WIDTH) / TILE_SIZE)
+    min_tile_y = math.floor(geometry["top"] / TILE_SIZE)
+    max_tile_y = math.floor((geometry["top"] + HEIGHT) / TILE_SIZE)
+    coordinates = [
+        (tile_x, tile_y)
+        for tile_y in range(min_tile_y, max_tile_y + 1)
+        for tile_x in range(min_tile_x, max_tile_x + 1)
+    ]
+
+    def fetch(coordinate):
+        tile_x, tile_y = coordinate
+        return (
+            tile_x,
+            tile_y,
+            _fetch_tile(geometry["zoom"], tile_x, tile_y, tile_source),
+        )
+
+    with ThreadPoolExecutor(max_workers=min(8, len(coordinates))) as executor:
+        tiles = executor.map(fetch, coordinates)
+        for tile_x, tile_y, tile in tiles:
+            if tile is None:
+                continue
+            left = round(tile_x * TILE_SIZE - geometry["left"])
+            top = round(tile_y * TILE_SIZE - geometry["top"])
+            image.paste(tile, (left, top))
+            loaded += 1
+    return loaded
 
 
 def render_map_preview(
@@ -204,13 +321,15 @@ def render_map_preview(
     use_tiles: bool = True,
     cadastral: dict | None = None,
     connect_points: bool = False,
+    tile_source: str = DEFAULT_TILE_SOURCE,
 ) -> bytes:
     if not points:
         raise ValueError("at least one valid point is required")
     cadastral_features = list((cadastral or {}).get("features") or [])
     source_date = str(((cadastral or {}).get("metadata") or {}).get("source_date") or "")
+    requested_tile_source = normalize_tile_source(tile_source)
     cache_key = (
-        f"{'tiles' if use_tiles else 'plain'}:"
+        f"{requested_tile_source if use_tiles else 'plain'}:"
         f"{'line' if connect_points else 'pins'}:"
         f"{serialize_preview_points(points)}:"
         f"{len(cadastral_features)}:{source_date}"
@@ -222,24 +341,24 @@ def render_map_preview(
             return cached
 
     geometry = _geometry(points)
-    image = Image.new("RGB", (WIDTH, HEIGHT), "#EEF3F7")
+    image = Image.new("RGBA", (WIDTH, HEIGHT), "#EEF3F7")
+    rendered_tile_source = ""
     if use_tiles:
-        min_tile_x = math.floor(geometry["left"] / TILE_SIZE)
-        max_tile_x = math.floor((geometry["left"] + WIDTH) / TILE_SIZE)
-        min_tile_y = math.floor(geometry["top"] / TILE_SIZE)
-        max_tile_y = math.floor((geometry["top"] + HEIGHT) / TILE_SIZE)
-        for tile_y in range(min_tile_y, max_tile_y + 1):
-            for tile_x in range(min_tile_x, max_tile_x + 1):
-                tile = _fetch_tile(geometry["zoom"], tile_x, tile_y)
-                if tile is None:
-                    continue
-                left = round(tile_x * TILE_SIZE - geometry["left"])
-                top = round(tile_y * TILE_SIZE - geometry["top"])
-                image.paste(tile, (left, top))
+        if _paste_tiles(image, geometry, requested_tile_source):
+            rendered_tile_source = requested_tile_source
+        elif requested_tile_source != TILE_SOURCE_OSM:
+            if _paste_tiles(image, geometry, TILE_SOURCE_OSM):
+                rendered_tile_source = TILE_SOURCE_OSM
 
     draw = ImageDraw.Draw(image)
-    cadastral_count = _draw_cadastral(draw, cadastral, geometry)
     screen_points = geometry["screen_points"]
+    cadastral_count = _draw_cadastral(
+        image,
+        cadastral,
+        geometry,
+        screen_points,
+    )
+    draw = ImageDraw.Draw(image)
     numbered = connect_points and len(screen_points) == 2
     if numbered:
         draw.line(screen_points, fill="#173B67", width=8, joint="curve")
@@ -260,9 +379,15 @@ def render_map_preview(
             )
 
     draw.rectangle((0, HEIGHT - 30, WIDTH, HEIGHT), fill=(255, 255, 255))
-    attribution = "© OpenStreetMap contributors"
+    attribution = ""
+    if rendered_tile_source == TILE_SOURCE_GSI_AERIAL:
+        attribution = "Source: GSI Japan aerial imagery"
+    elif rendered_tile_source == TILE_SOURCE_OSM:
+        attribution = "© OpenStreetMap contributors"
     if cadastral_count:
-        attribution += " / Cadastral: Gojo City CC BY 4.0"
+        attribution += (
+            " / " if attribution else ""
+        ) + "Cadastral: Gojo City CC BY 4.0"
     draw.text(
         (WIDTH - 12, HEIGHT - 15),
         attribution,
@@ -272,7 +397,7 @@ def render_map_preview(
     )
 
     output = BytesIO()
-    image.save(output, format="PNG", optimize=True)
+    image.convert("RGB").save(output, format="PNG", optimize=True)
     result = output.getvalue()
     with _cache_lock:
         _cache[cache_key] = result

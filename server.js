@@ -38,6 +38,12 @@ const FLEX_REPLY_ENABLED = String(
 const MAP_PREVIEW_TILES_ENABLED = String(
   process.env.MAP_PREVIEW_TILES_ENABLED ?? 'true',
 ).toLowerCase() !== 'false';
+const MAP_PREVIEW_TILE_SOURCE_RAW = String(
+  process.env.MAP_PREVIEW_TILE_SOURCE || 'gsi_aerial',
+).trim().toLowerCase();
+const MAP_PREVIEW_TILE_SOURCE = MAP_PREVIEW_TILE_SOURCE_RAW === 'osm'
+  ? 'osm'
+  : 'gsi_aerial';
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',
@@ -386,6 +392,7 @@ app.get('/healthz/search', (_req, res) => {
     search_engine: SEARCH_ENGINE_VERSION,
     flex_reply_enabled: FLEX_REPLY_ENABLED,
     map_preview_tiles_enabled: MAP_PREVIEW_TILES_ENABLED,
+    map_preview_tile_source: MAP_PREVIEW_TILE_SOURCE,
     revision: String(process.env.RENDER_GIT_COMMIT || '').slice(0, 12),
     gps_count: poleCoords.size,
     gps_sha256: gpsSha256,
@@ -441,6 +448,7 @@ app.get('/api/map-preview', async (req, res) => {
       useTiles: MAP_PREVIEW_TILES_ENABLED,
       cadastral,
       connectPoints: String(req.query.connect || '') === '1',
+      tileSource: MAP_PREVIEW_TILE_SOURCE,
     });
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Cache-Control', 'public, max-age=86400');

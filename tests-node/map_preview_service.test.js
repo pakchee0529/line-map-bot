@@ -5,10 +5,16 @@ const test = require('node:test');
 
 const sharp = require('sharp');
 const {
+  DEFAULT_TILE_SOURCE,
   HEIGHT,
+  TILE_SOURCE_GSI_AERIAL,
+  TILE_SOURCE_OSM,
   WIDTH,
+  nearbyCadastralLabelKeys,
+  normalizeTileSource,
   parsePreviewPoints,
   renderMapPreview,
+  previewGeometry,
   serializePreviewPoints,
 } = require('../map_preview_service');
 
@@ -64,4 +70,73 @@ test('renders a cadastral polygon overlay without changing output dimensions', a
   assert.equal(metadata.width, WIDTH);
   assert.equal(metadata.height, HEIGHT);
   assert.ok(buffer.length > 1000);
+});
+
+test('aerial imagery is default while OSM remains selectable', () => {
+  assert.equal(DEFAULT_TILE_SOURCE, TILE_SOURCE_GSI_AERIAL);
+  assert.equal(normalizeTileSource('osm'), TILE_SOURCE_OSM);
+  assert.equal(normalizeTileSource('unknown'), TILE_SOURCE_GSI_AERIAL);
+});
+
+test('cadastral labels are limited to the nearest label per endpoint', () => {
+  const points = [
+    { lat: 34.35771, lng: 135.6636 },
+    { lat: 34.3575, lng: 135.66363 },
+  ];
+  const features = [
+    {
+      id: 'near-young',
+      properties: { layer: 'label', label: '358' },
+      geometry: { type: 'Point', coordinates: [135.66359, 34.35772] },
+    },
+    {
+      id: 'near-old',
+      properties: { layer: 'label', label: '372' },
+      geometry: { type: 'Point', coordinates: [135.66364, 34.35749] },
+    },
+    {
+      id: 'extra',
+      properties: { layer: 'label', label: '999' },
+      geometry: { type: 'Point', coordinates: [135.6645, 34.3585] },
+    },
+  ];
+  assert.deepEqual(
+    [...nearbyCadastralLabelKeys(features, previewGeometry(points))].sort(),
+    ['near-old', 'near-young'],
+  );
+});
+
+test('aerial tile failure falls back to OSM tiles', async () => {
+  const originalFetch = global.fetch;
+  const requestedUrls = [];
+  const tile = await sharp({
+    create: {
+      width: 256,
+      height: 256,
+      channels: 3,
+      background: 'white',
+    },
+  }).png().toBuffer();
+  global.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    const ok = String(url).includes('tile.openstreetmap.org');
+    return {
+      ok,
+      arrayBuffer: async () => tile.buffer.slice(
+        tile.byteOffset,
+        tile.byteOffset + tile.byteLength,
+      ),
+    };
+  };
+  try {
+    const buffer = await renderMapPreview(
+      [{ lat: 34.123456, lng: 135.654321 }],
+      { tileSource: TILE_SOURCE_GSI_AERIAL },
+    );
+    assert.ok(buffer.length > 1000);
+  } finally {
+    global.fetch = originalFetch;
+  }
+  assert.ok(requestedUrls.some((url) => url.includes('cyberjapandata.gsi.go.jp')));
+  assert.ok(requestedUrls.some((url) => url.includes('tile.openstreetmap.org')));
 });

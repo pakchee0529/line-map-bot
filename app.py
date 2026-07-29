@@ -72,6 +72,13 @@ CADASTRAL_DATA_PATH = Path(
 CADASTRAL_MAX_FEATURES = int(os.getenv("CADASTRAL_MAX_FEATURES", "2500"))
 FLEX_REPLY_ENABLED = env_flag("LINE_FLEX_REPLY_ENABLED", True)
 MAP_PREVIEW_TILES_ENABLED = env_flag("MAP_PREVIEW_TILES_ENABLED", True)
+_MAP_PREVIEW_TILE_SOURCE_RAW = os.getenv(
+    "MAP_PREVIEW_TILE_SOURCE",
+    "gsi_aerial",
+).strip().lower()
+MAP_PREVIEW_TILE_SOURCE = (
+    "osm" if _MAP_PREVIEW_TILE_SOURCE_RAW == "osm" else "gsi_aerial"
+)
 
 
 def ensure_bundled_cadastral_data() -> None:
@@ -1920,6 +1927,7 @@ def search_healthz():
             "search_engine": SEARCH_ENGINE_VERSION,
             "flex_reply_enabled": FLEX_REPLY_ENABLED,
             "map_preview_tiles_enabled": MAP_PREVIEW_TILES_ENABLED,
+            "map_preview_tile_source": MAP_PREVIEW_TILE_SOURCE,
             "revision": os.getenv("RENDER_GIT_COMMIT", "")[:12],
             "gps_count": len(POLE_COORDS),
             "gps_sha256": GPS_DATA_SHA256,
@@ -1948,6 +1956,7 @@ def map_preview_image():
             use_tiles=MAP_PREVIEW_TILES_ENABLED,
             cadastral=cadastral,
             connect_points=request.args.get("connect") == "1",
+            tile_source=MAP_PREVIEW_TILE_SOURCE,
         )
     except Exception:
         app.logger.exception("map preview generation failed")
