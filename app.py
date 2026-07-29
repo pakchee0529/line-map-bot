@@ -1,4 +1,4 @@
-from flask import Flask, request, abort, render_template
+from flask import Flask, request, abort, render_template, jsonify
 import os
 import json
 import unicodedata
@@ -10,11 +10,18 @@ import threading
 import uuid
 import time
 import secrets
+import sqlite3
+import gzip
+import shutil
+import hashlib
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+from pathlib import Path
 
 import redis
 from dotenv import load_dotenv
+from cadastral_service import CadastralError, CadastralQueryError, CadastralStore
+from search_core import resolve_one as resolve_one_core
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
@@ -38,6 +45,50 @@ CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 REDIS_URL = os.getenv("REDIS_URL")
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+APP_DIR = Path(__file__).resolve().parent
+CADASTRAL_DATA_PATH = Path(
+    os.getenv(
+        "CADASTRAL_DATA_PATH",
+        str(APP_DIR / "data" / "cadastral" / "gojo_chiban.sqlite"),
+    )
+)
+CADASTRAL_MAX_FEATURES = int(os.getenv("CADASTRAL_MAX_FEATURES", "2500"))
+
+
+def ensure_bundled_cadastral_data() -> None:
+    if CADASTRAL_DATA_PATH.exists():
+        return
+    bundle_path = APP_DIR / "data" / "cadastral" / "gojo_chiban.sqlite.gz"
+    if not bundle_path.exists():
+        return
+    try:
+        CADASTRAL_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = CADASTRAL_DATA_PATH.with_suffix(".sqlite.tmp")
+        with gzip.open(bundle_path, "rb") as source, temp_path.open("wb") as target:
+            shutil.copyfileobj(source, target)
+        temp_path.replace(CADASTRAL_DATA_PATH)
+    except OSError as exc:
+        print(f"[cadastral] bundled dataset extraction failed: {exc}")
+
+
+ensure_bundled_cadastral_data()
+CADASTRAL_LAYER_ENABLED = env_flag(
+    "CADASTRAL_LAYER_ENABLED",
+    CADASTRAL_DATA_PATH.exists(),
+)
+CADASTRAL_STORE = CadastralStore(
+    CADASTRAL_DATA_PATH,
+    max_features=CADASTRAL_MAX_FEATURES,
+)
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
@@ -707,6 +758,10 @@ def load_pole_coords():
 
 
 POLE_COORDS, GPS_POINTS = load_pole_coords()
+SEARCH_ENGINE_VERSION = "pc-core-v2"
+GPS_DATA_SHA256 = hashlib.sha256(
+    (APP_DIR / "GPS.json").read_bytes()
+).hexdigest()
 
 # ----------------------------
 # Formatting helpers
@@ -763,6 +818,39 @@ def format_not_found(display_name: str) -> str:
 今回は見つからなかったよ💦
 
 地名や番号を少し変えると見つかるかも"""
+
+
+def format_not_found_result(result: dict) -> str:
+    lines = [format_not_found(str(result.get("display_name") or ""))]
+    details = result.get("suggestion_details")
+    suggestions = []
+    if isinstance(details, list):
+        for detail in details[:5]:
+            if not isinstance(detail, dict):
+                continue
+            name = str(detail.get("name") or "")
+            reason = str(detail.get("reason") or "")
+            if name:
+                suggestions.append(f"- {name}（{reason}）" if reason else f"- {name}")
+    if suggestions:
+        lines.extend(["", "近い候補", *suggestions])
+    warnings = [str(item) for item in result.get("warnings") or [] if str(item)]
+    if warnings:
+        lines.extend(["", *[f"注意: {warning}" for warning in warnings[:3]]])
+    return "\n".join(lines)
+
+
+def append_search_result_notes(block: str, result: dict) -> str:
+    lines = [block]
+    warnings = [str(item) for item in result.get("warnings") or [] if str(item)]
+    candidate_notes = [
+        str(item) for item in result.get("candidate_notes") or [] if str(item)
+    ]
+    if warnings:
+        lines.extend(["", *[f"注意: {warning}" for warning in warnings[:3]]])
+    if candidate_notes:
+        lines.extend(["", *candidate_notes[:2]])
+    return "\n".join(lines)
 
 
 def format_location_result(map_url: str, count: int, header=None) -> str:
@@ -827,6 +915,15 @@ def format_multi_line_results(results, multi_map_url=None):
         lines.append("見つからなかったもの")
         for r in not_found_results:
             lines.append(f"- {r['display_name']}")
+            details = r.get("suggestion_details")
+            if isinstance(details, list) and details:
+                names = [
+                    str(item.get("name") or "")
+                    for item in details[:3]
+                    if isinstance(item, dict) and item.get("name")
+                ]
+                if names:
+                    lines.append(f"  近い候補: {', '.join(names)}")
 
     if multi_map_url:
         if lines:
@@ -856,8 +953,9 @@ def format_resolve_results(results, include_single_map=True, multi_map_url=None)
             else:
                 map_url = r["map_url"] if include_single_map else None
                 block = format_single_result(r["display_name"], r["url"], map_url, r["note"])
+            block = append_search_result_notes(block, r)
         else:
-            block = format_not_found(r["display_name"])
+            block = format_not_found_result(r)
 
         blocks.append(block)
 
@@ -1050,6 +1148,38 @@ def extract_found_points(results):
         })
 
     return points
+
+
+def find_place_points(place_name: str, limit: int = 1000):
+    normalized_place = normalize_key(place_name)
+    if not normalized_place:
+        return []
+    points = []
+    seen = set()
+    for point in GPS_POINTS:
+        search_name = str(point.get("search_name") or "")
+        parsed = parse_pole_name(search_name)
+        if not parsed or str(parsed.get("place") or "") != normalized_place:
+            continue
+        identity = (
+            search_name,
+            round(float(point["lat"]), 7),
+            round(float(point["lng"]), 7),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        points.append(
+            {
+                "display_name": search_name,
+                "lat": float(point["lat"]),
+                "lng": float(point["lng"]),
+            }
+        )
+        if len(points) >= limit:
+            break
+    return points
+
 
 # ----------------------------
 # Pole parsing / search logic
@@ -1330,76 +1460,42 @@ def find_first_existing(candidates):
 
 
 def resolve_one(line: str):
-    info = create_search_keys(line)
-    display_name = info["display_name"]
-    is_range = info["is_range"]
-    hikikomi = info["hikikomi"]
-    front_key = info["front_key"]
-    back_key = info["back_key"]
+    result = resolve_one_core(line, POLE_COORDS)
+    result["map_url"] = None
+    result["span_map_url"] = None
+    adopted = str(result.get("adopted") or "")
 
-    adopted = None
-    preferred_key = None
-
-    if is_range and back_key and not hikikomi:
-        if exact_match(back_key):
-            adopted = back_key
-            preferred_key = back_key
-        elif exact_match(front_key):
-            adopted = front_key
-            preferred_key = front_key
-        else:
-            adopted = find_first_existing(general_search_order(back_key))
-            if adopted:
-                preferred_key = back_key
-            else:
-                adopted = find_first_existing(general_search_order(front_key))
-                if adopted:
-                    preferred_key = front_key
-    else:
-        adopted = find_first_existing(general_search_order(front_key))
-        preferred_key = front_key
-
-    if not adopted:
-        return {
-            "found": False,
-            "display_name": display_name,
-            "url": None,
-            "note": None,
-            "is_range": is_range,
-            "map_url": None,
-            "adopted": None,
-            "span_map_url": None,
-        }
-
-    latlon = POLE_COORDS[adopted]
-    url = google_maps_url(latlon)
-    note = None
-    map_url = None
-
-    if adopted != preferred_key:
-        note = f"（{display_name} → {adopted}）"
-
-    if not is_range:
-        parsed = parse_latlng(latlon)
+    if adopted and not result.get("is_range"):
+        latlon = POLE_COORDS.get(adopted)
+        parsed = parse_latlng(latlon) if latlon else None
         if parsed:
-            map_url = build_map_url(parsed[0], parsed[1])
+            result["map_url"] = build_map_url(parsed[0], parsed[1])
 
-    span_map_url = compute_span_two_point_url(info)
-    if span_map_url:
-        url = None
-        note = None
-
-    return {
-        "found": True,
-        "display_name": display_name,
-        "url": url,
-        "note": note,
-        "is_range": is_range,
-        "map_url": map_url,
-        "adopted": adopted,
-        "span_map_url": span_map_url,
-    }
-
+    span_points = result.get("span_points")
+    if isinstance(span_points, list) and len(span_points) >= 2:
+        resolved_points = []
+        for point in span_points[:2]:
+            if not isinstance(point, dict):
+                continue
+            point_adopted = str(point.get("adopted") or "")
+            latlon = POLE_COORDS.get(point_adopted)
+            parsed = parse_latlng(latlon) if latlon else None
+            if parsed:
+                resolved_points.append((point, parsed))
+        if len(resolved_points) == 2:
+            first, second = resolved_points
+            result["span_map_url"] = build_two_point_multi_map_url(
+                str(first[0].get("input") or first[0].get("adopted") or ""),
+                first[1][0],
+                first[1][1],
+                str(second[0].get("input") or second[0].get("adopted") or ""),
+                second[1][0],
+                second[1][1],
+                span_display=str(result.get("display_name") or "") or None,
+            )
+            result["url"] = None
+            result["note"] = None
+    return result
 
 def resolve_lines(text: str):
     lines = split_input_lines(text)
@@ -1442,6 +1538,15 @@ def process_text_logic(user_text: str) -> str:
     results = resolve_lines(user_text)
     if results and results[0]["found"]:
         return format_resolve_results(results)
+
+    place_points = find_place_points(user_text)
+    if place_points:
+        place_map_url = build_multi_map_url(place_points)
+        if place_map_url:
+            return (
+                f"{make_display_name(user_text)}の電柱を{len(place_points)}件見つけたよ\n"
+                f"{place_map_url}"
+            )
 
     geo = geocode_address(user_text)
     if geo:
@@ -1681,6 +1786,64 @@ def healthz():
     return "ok", 200
 
 
+@app.route("/healthz/search")
+def search_healthz():
+    return jsonify(
+        {
+            "search_engine": SEARCH_ENGINE_VERSION,
+            "revision": os.getenv("RENDER_GIT_COMMIT", "")[:12],
+            "gps_count": len(POLE_COORDS),
+            "gps_sha256": GPS_DATA_SHA256,
+        }
+    ), 200
+
+
+@app.route("/healthz/cadastral")
+def cadastral_healthz():
+    payload = {
+        "enabled": CADASTRAL_LAYER_ENABLED,
+        "available": CADASTRAL_STORE.available,
+    }
+    if CADASTRAL_STORE.available:
+        try:
+            manifest = CADASTRAL_STORE.manifest()
+            payload["source_date"] = manifest.get("source_date", "")
+            payload["license"] = manifest.get("license", "")
+        except (CadastralError, sqlite3.Error):
+            payload["available"] = False
+    status = 200 if (not CADASTRAL_LAYER_ENABLED or payload["available"]) else 503
+    return jsonify(payload), status
+
+
+@app.route("/api/cadastral/features")
+def cadastral_features():
+    if not CADASTRAL_LAYER_ENABLED:
+        return jsonify({"error": "cadastral layer is disabled"}), 404
+    if not CADASTRAL_STORE.available:
+        return jsonify({"error": "cadastral dataset is unavailable"}), 503
+
+    raw_bbox = (request.args.get("bbox") or "").strip()
+    try:
+        bbox_parts = tuple(float(value) for value in raw_bbox.split(","))
+        if len(bbox_parts) != 4:
+            raise ValueError
+        zoom = request.args.get("zoom", type=int)
+        if zoom is None:
+            raise ValueError
+        result = CADASTRAL_STORE.query(bbox_parts, zoom)
+    except (TypeError, ValueError, CadastralQueryError):
+        return jsonify({"error": "invalid bbox or zoom"}), 400
+    except CadastralError:
+        return jsonify({"error": "cadastral dataset is unavailable"}), 503
+    except sqlite3.Error:
+        app.logger.exception("cadastral database query failed")
+        return jsonify({"error": "cadastral query failed"}), 503
+
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return response
+
+
 @app.route("/map")
 def map_view():
     lat = request.args.get("lat", type=float)
@@ -1740,6 +1903,7 @@ def multi_map_view():
             "multi_map.html",
             points=valid_points,
             is_two_point_mode=False,
+            cadastral_enabled=False,
         )
 
     p1 = request.args.get("p1")
@@ -1772,6 +1936,9 @@ def multi_map_view():
             "multi_map.html",
             points=valid_points,
             is_two_point_mode=True,
+            cadastral_enabled=(
+                CADASTRAL_LAYER_ENABLED and CADASTRAL_STORE.available
+            ),
         )
 
     return "missing id or p1/p2", 400

@@ -17,3 +17,10 @@ Thumbs.db
 
 # ログ
 *.log
+
+# 生成済み地番参考図データ（GitHub Release / Render build で配布）
+data/cadastral/*.sqlite
+data/cadastral/*.sqlite-*
+data/cadastral/*.db
+data/cadastral/*.db-*
+!data/cadastral/gojo_chiban.sqlite.gz

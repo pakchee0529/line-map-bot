@@ -40,15 +40,88 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .cadastral-control {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 1000;
+      width: min(260px, calc(100vw - 20px));
+      padding: 8px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .cadastral-toggle {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid #9a3412;
+      border-radius: 6px;
+      background: #fff;
+      color: #7c2d12;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .cadastral-toggle.is-on {
+      background: #9a3412;
+      color: #fff;
+    }
+    .cadastral-status {
+      margin-top: 6px;
+      color: #374151;
+    }
+    .cadastral-note {
+      margin-top: 4px;
+      color: #6b7280;
+      font-size: 10px;
+    }
+    .cadastral-label-icon {
+      background: transparent;
+      border: none;
+      pointer-events: none;
+    }
+    .cadastral-label {
+      display: inline-block;
+      color: #7c2d12;
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1;
+      white-space: nowrap;
+      text-shadow:
+        -1px -1px 0 #fff,
+         1px -1px 0 #fff,
+        -1px  1px 0 #fff,
+         1px  1px 0 #fff;
+      transform-origin: center center;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
+  {% if cadastral_enabled %}
+  <div class="cadastral-control">
+    <button
+      id="cadastral-toggle"
+      class="cadastral-toggle"
+      type="button"
+      aria-pressed="false"
+    >地番図 OFF</button>
+    <div id="cadastral-status" class="cadastral-status">
+      OFF（必要なときだけ表示）
+    </div>
+    <div class="cadastral-note">
+      五條市地番参考図。正確な筆界・権利関係の確認には使用できません。
+    </div>
+  </div>
+  {% endif %}
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const points = {{ points|tojson }};
     const isTwoPointMode = {{ is_two_point_mode|default(false)|tojson }};
+    const cadastralEnabled = {{ cadastral_enabled|default(false)|tojson }};
+    const cadastralEndpoint = {{ url_for("cadastral_features")|tojson }};
 
     const map = L.map('map');
 
@@ -110,6 +183,209 @@
         padding: [30, 30],
         maxZoom: 18
       });
+    }
+
+    if (cadastralEnabled && isTwoPointMode) {
+      map.createPane("cadastralPane");
+      map.getPane("cadastralPane").style.zIndex = 350;
+      map.getPane("cadastralPane").style.pointerEvents = "none";
+      map.createPane("cadastralLabelPane");
+      map.getPane("cadastralLabelPane").style.zIndex = 360;
+      map.getPane("cadastralLabelPane").style.pointerEvents = "none";
+
+      const cadastralLayers = L.layerGroup().addTo(map);
+      const toggleButton = document.getElementById("cadastral-toggle");
+      const statusElement = document.getElementById("cadastral-status");
+      const attribution =
+        '地番参考図を加工して利用: ' +
+        '<a href="https://www.city.gojo.lg.jp/soshiki/zeimu/chibanzu/19460.html" ' +
+        'target="_blank" rel="noopener noreferrer">五條市</a> / ' +
+        '<a href="https://creativecommons.org/licenses/by/4.0/deed.ja" ' +
+        'target="_blank" rel="noopener noreferrer">CC BY 4.0</a>';
+      let cadastralOn = false;
+      let requestController = null;
+      let loadTimer = null;
+      let attributionVisible = false;
+
+      function escapeCadastralText(value) {
+        return String(value == null ? "" : value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function setCadastralStatus(text) {
+        statusElement.textContent = text;
+      }
+
+      function setAttributionVisible(visible) {
+        if (visible && !attributionVisible) {
+          map.attributionControl.addAttribution(attribution);
+          attributionVisible = true;
+        } else if (!visible && attributionVisible) {
+          map.attributionControl.removeAttribution(attribution);
+          attributionVisible = false;
+        }
+      }
+
+      function clearPendingCadastralLoad() {
+        if (loadTimer) {
+          clearTimeout(loadTimer);
+          loadTimer = null;
+        }
+        if (requestController) {
+          requestController.abort();
+          requestController = null;
+        }
+      }
+
+      function addCadastralFeature(feature) {
+        const layerName = feature.properties && feature.properties.layer;
+        if (layerName === "label" && feature.geometry.type === "Point") {
+          const coordinates = feature.geometry.coordinates;
+          const label = escapeCadastralText(feature.properties.label);
+          const angleValue = Number(feature.properties.angle);
+          const angle = Number.isFinite(angleValue) ? angleValue : 0;
+          const icon = L.divIcon({
+            className: "cadastral-label-icon",
+            html:
+              '<span class="cadastral-label" style="transform:rotate(' +
+              angle +
+              'deg)">' +
+              label +
+              "</span>",
+            iconSize: null,
+            iconAnchor: [0, 0],
+          });
+          L.marker([coordinates[1], coordinates[0]], {
+            icon,
+            pane: "cadastralLabelPane",
+            interactive: false,
+          }).addTo(cadastralLayers);
+          return;
+        }
+
+        const style = layerName === "leader"
+          ? {
+              color: "#9a3412",
+              weight: 1,
+              opacity: 0.8,
+              interactive: false,
+              pane: "cadastralPane",
+            }
+          : {
+              color: "#c2410c",
+              weight: 1,
+              opacity: 0.9,
+              fillColor: "#fdba74",
+              fillOpacity: 0.06,
+              interactive: false,
+              pane: "cadastralPane",
+            };
+        L.geoJSON(feature, {
+          style: () => style,
+          pane: "cadastralPane",
+          interactive: false,
+        }).addTo(cadastralLayers);
+      }
+
+      async function loadCadastralFeatures() {
+        if (!cadastralOn) {
+          return;
+        }
+        const zoom = map.getZoom();
+        if (zoom < 17) {
+          cadastralLayers.clearLayers();
+          setCadastralStatus("拡大すると地番図を表示します");
+          return;
+        }
+
+        clearPendingCadastralLoad();
+        requestController = new AbortController();
+        const currentController = requestController;
+        const boundsValue = map.getBounds();
+        const bbox = [
+          boundsValue.getWest(),
+          boundsValue.getSouth(),
+          boundsValue.getEast(),
+          boundsValue.getNorth(),
+        ].map(value => value.toFixed(7)).join(",");
+        const url =
+          cadastralEndpoint +
+          "?bbox=" +
+          encodeURIComponent(bbox) +
+          "&zoom=" +
+          encodeURIComponent(zoom);
+        setCadastralStatus("地番図を読み込み中");
+
+        try {
+          const response = await fetch(url, {
+            signal: currentController.signal,
+            credentials: "same-origin",
+          });
+          if (!response.ok) {
+            throw new Error("HTTP " + response.status);
+          }
+          const data = await response.json();
+          if (requestController !== currentController || !cadastralOn) {
+            return;
+          }
+          cadastralLayers.clearLayers();
+          (data.features || []).forEach(addCadastralFeature);
+          const sourceDate =
+            data.metadata && data.metadata.source_date
+              ? " / " + data.metadata.source_date + "時点"
+              : "";
+          const truncated =
+            data.metadata && data.metadata.truncated ? " / 表示上限あり" : "";
+          if (data.metadata && data.metadata.outside_coverage) {
+            setCadastralStatus("五條市地番参考図の範囲外です");
+          } else {
+            setCadastralStatus(
+              "表示 " + (data.features || []).length + "件" +
+              sourceDate + truncated
+            );
+          }
+        } catch (error) {
+          if (error && error.name === "AbortError") {
+            return;
+          }
+          cadastralLayers.clearLayers();
+          setCadastralStatus("地番図を表示できません（通常地図は利用できます）");
+        } finally {
+          if (requestController === currentController) {
+            requestController = null;
+          }
+        }
+      }
+
+      function scheduleCadastralLoad() {
+        if (!cadastralOn) {
+          return;
+        }
+        if (loadTimer) {
+          clearTimeout(loadTimer);
+        }
+        loadTimer = setTimeout(loadCadastralFeatures, 250);
+      }
+
+      toggleButton.addEventListener("click", () => {
+        cadastralOn = !cadastralOn;
+        toggleButton.classList.toggle("is-on", cadastralOn);
+        toggleButton.setAttribute("aria-pressed", String(cadastralOn));
+        toggleButton.textContent = cadastralOn ? "地番図 ON" : "地番図 OFF";
+        setAttributionVisible(cadastralOn);
+        if (cadastralOn) {
+          scheduleCadastralLoad();
+        } else {
+          clearPendingCadastralLoad();
+          cadastralLayers.clearLayers();
+          setCadastralStatus("OFF（必要なときだけ表示）");
+        }
+      });
+
+      map.on("moveend zoomend", scheduleCadastralLoad);
     }
   </script>
 </body>
