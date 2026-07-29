@@ -30,6 +30,19 @@ class PythonFlexRoutesTest(unittest.TestCase):
         self.assertIn("/api/map-preview?", card["preview_url"])
         self.assertIn("connect=1", card["preview_url"])
 
+    def test_single_pole_search_keeps_nearby_poles_in_flex_card(self):
+        response = app_module.build_search_response("木ノ原40E1S3")
+        self.assertEqual(len(response["cards"]), 1)
+        card = response["cards"][0]
+        self.assertEqual(card["status"], "found")
+        self.assertIn("/map?lat=", card["primary_url"])
+        self.assertEqual(card["primary_label"], "近くの電柱を見る")
+        self.assertIn("google.com/maps", card["secondary_url"])
+        self.assertEqual(card["secondary_label"], "Googleマップで地点確認")
+        self.assertTrue(any(row["label"] == "近隣電柱" for row in card["rows"]))
+        self.assertIn("%7C", card["preview_url"])
+        self.assertNotIn("connect=1", card["preview_url"])
+
     def test_map_preview_route_returns_png(self):
         response = self.client.get(
             "/api/map-preview",

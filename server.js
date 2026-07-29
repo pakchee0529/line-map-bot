@@ -191,7 +191,12 @@ function formatResult(result) {
   const lines = [result.displayName];
   if (result.found) {
     const point = coordinatesFor(result.adopted);
-    if (point) lines.push(googleMapsUrl(point));
+    if (point) {
+      lines.push(googleMapsUrl(point));
+      if (!result.isRange) {
+        lines.push(`周辺200m: ${BASE_URL}/map?lat=${point.lat}&lng=${point.lng}`);
+      }
+    }
     const spanUrl = twoPointMapUrl(result);
     if (spanUrl) lines.push(`2点地図: ${spanUrl}`);
   } else {
@@ -215,6 +220,13 @@ function cardForSearchResult(result) {
   const points = resultPoints(result);
   const spanUrl = twoPointMapUrl(result);
   const primaryPoint = points[points.length - 1] || null;
+  const singleNearbyPoints = result.found && !result.isRange && points.length === 1
+    ? findNearby(points[0].lat, points[0].lng, 200)
+      .filter((point) => point.name !== result.adopted)
+    : [];
+  const singleMapUrl = result.found && !result.isRange && points.length === 1
+    ? `${BASE_URL}/map?lat=${points[0].lat}&lng=${points[0].lng}`
+    : '';
   let status = 'found';
   if (!result.found) {
     status = 'unresolved';
@@ -229,18 +241,30 @@ function cardForSearchResult(result) {
       value: item.adopted,
     }))
     : (result.adopted ? [{ label: '採用地点', value: result.adopted }] : []);
+  if (singleMapUrl) {
+    rows.push({ label: '近隣電柱', value: `${singleNearbyPoints.length}件` });
+  }
   return {
     status,
     title: result.displayName,
     rows,
     notes: result.candidateNotes,
     warnings: result.warnings,
-    primaryUrl: spanUrl || (primaryPoint ? googleMapsUrl(primaryPoint) : ''),
-    primaryLabel: spanUrl ? '2点地図・地番図を開く' : 'Googleマップを開く',
-    secondaryUrl: spanUrl && primaryPoint ? googleMapsUrl(primaryPoint) : '',
-    secondaryLabel: '老番側をGoogleマップで開く',
+    primaryUrl: spanUrl || singleMapUrl || (primaryPoint ? googleMapsUrl(primaryPoint) : ''),
+    primaryLabel: spanUrl
+      ? '2点地図・地番図を開く'
+      : (singleMapUrl ? '近くの電柱を見る' : 'Googleマップを開く'),
+    secondaryUrl: (spanUrl || singleMapUrl) && primaryPoint
+      ? googleMapsUrl(primaryPoint)
+      : '',
+    secondaryLabel: singleMapUrl
+      ? 'Googleマップで地点確認'
+      : '老番側をGoogleマップで開く',
     previewUrl: points.length
-      ? mapPreviewUrl(points, { connectPoints: Boolean(spanUrl) })
+      ? mapPreviewUrl(
+        [...points, ...singleNearbyPoints.slice(0, 19)],
+        { connectPoints: Boolean(spanUrl) },
+      )
       : '',
     suggestionText: !result.found && result.suggestionDetails.length
       ? result.suggestionDetails[0].name

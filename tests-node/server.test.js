@@ -21,6 +21,19 @@ test('two-point search builds a Flex-ready card with a map preview', () => {
   assert.match(response.cards[0].previewUrl, /connect=1/);
 });
 
+test('single pole Flex card keeps its nearby 200m context', () => {
+  const response = buildSearchResponse('木ノ原40E1S3');
+  assert.equal(response.cards.length, 1);
+  assert.equal(response.cards[0].status, 'found');
+  assert.match(response.cards[0].primaryUrl, /\/map\?lat=/);
+  assert.equal(response.cards[0].primaryLabel, '近くの電柱を見る');
+  assert.match(response.cards[0].secondaryUrl, /google\.com\/maps/);
+  assert.equal(response.cards[0].secondaryLabel, 'Googleマップで地点確認');
+  assert.ok(response.cards[0].rows.some((row) => row.label === '近隣電柱'));
+  assert.match(response.cards[0].previewUrl, /%7C/);
+  assert.doesNotMatch(response.cards[0].previewUrl, /connect=1/);
+});
+
 test('place-name preview uses independent pins without a fabricated route', () => {
   const response = buildSearchResponse('木ノ原');
   assert.equal(response.cards.length, 1);

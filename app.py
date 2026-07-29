@@ -1507,6 +1507,26 @@ def _card_for_result(result: dict) -> dict:
     points = _result_points(result)
     span_url = str(result.get("span_map_url") or "")
     found = bool(result.get("found"))
+    single_nearby_points = []
+    single_map_url = ""
+    if found and not result.get("is_range") and len(points) == 1:
+        center = points[0]
+        adopted_key = normalize_key(str(result.get("adopted") or ""))
+        for item in find_nearby(center["lat"], center["lng"], 200):
+            if str(item.get("search_name") or "") == adopted_key:
+                continue
+            single_nearby_points.append(
+                {
+                    "display_name": str(item.get("name") or ""),
+                    "lat": item["lat"],
+                    "lng": item["lng"],
+                    "role": "",
+                }
+            )
+        single_map_url = str(
+            result.get("map_url")
+            or build_map_url(center["lat"], center["lng"])
+        )
     candidate_notes = [
         str(item) for item in result.get("candidate_notes") or [] if str(item)
     ]
@@ -1531,6 +1551,8 @@ def _card_for_result(result: dict) -> dict:
         rows = [{"label": "採用地点", "value": str(result["adopted"])}]
     else:
         rows = []
+    if single_map_url:
+        rows.append({"label": "近隣電柱", "value": f"{len(single_nearby_points)}件"})
     suggestions = result.get("suggestion_details")
     suggestion_text = ""
     if isinstance(suggestions, list) and suggestions:
@@ -1545,14 +1567,22 @@ def _card_for_result(result: dict) -> dict:
         "warnings": [
             str(item) for item in result.get("warnings") or [] if str(item)
         ],
-        "primary_url": span_url or str(result.get("url") or ""),
+        "primary_url": span_url or single_map_url or str(result.get("url") or ""),
         "primary_label": (
-            "2点地図・地番図を開く" if span_url else "Googleマップを開く"
+            "2点地図・地番図を開く"
+            if span_url
+            else ("近くの電柱を見る" if single_map_url else "Googleマップを開く")
         ),
-        "secondary_url": str(result.get("url") or "") if span_url else "",
-        "secondary_label": "老番側をGoogleマップで開く",
+        "secondary_url": (
+            str(result.get("url") or "") if span_url or single_map_url else ""
+        ),
+        "secondary_label": (
+            "Googleマップで地点確認"
+            if single_map_url
+            else "老番側をGoogleマップで開く"
+        ),
         "preview_url": build_map_preview_url(
-            points,
+            points + single_nearby_points[:19],
             connect_points=bool(span_url),
         ),
         "suggestion_text": suggestion_text if not found else "",
