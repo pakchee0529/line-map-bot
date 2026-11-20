@@ -1586,10 +1586,12 @@ def _card_for_result(result: dict) -> dict:
             connect_points=bool(span_url),
         ),
         "suggestion_text": suggestion_text if not found else "",
+        "candidates": [item["name"] for item in (suggestions or [])[:5]
+                       if isinstance(item, dict) and item.get("name")] if not found else [],
     }
 
 
-def build_search_response(user_text: str) -> dict:
+def build_search_response(user_text: str, *, portal=False) -> dict:
     parsed = parse_latlng(user_text)
     if parsed:
         lat, lng = parsed
@@ -1652,7 +1654,7 @@ def build_search_response(user_text: str) -> dict:
                 "primary_label": "まとめて地図を開く",
                 "preview_url": build_map_preview_url(points),
             }
-            if len(cards) >= 12:
+            if not portal and len(cards) >= 12:
                 cards = cards[:11]
             cards.append(summary_card)
         return {"plain_text": plain_text, "cards": cards}
@@ -1943,6 +1945,39 @@ def process_admin_command(user_id, user_text, user_data):
 @app.route("/")
 def index():
     return "LINE pole map bot is running."
+
+
+@app.post("/api/portal/pole-search")
+def portal_pole_search():
+    if not request.content_length or request.content_length > 24000:
+        abort(413)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400)
+    query = data.get("query")
+    if not isinstance(query, str) or not query.strip() or len(query) > 1800:
+        abort(400)
+    if len(split_input_lines(query)) > 50:
+        abort(400)
+    ticket = data.get("ticket")
+    if not isinstance(ticket, dict) or not isinstance(ticket.get("tag"), str):
+        abort(403)
+    check = {"action": "verify_pole_search", "digest": hashlib.sha256(query.encode()).hexdigest(),
+             "expires": ticket.get("expires"), "tag": ticket["tag"]}
+    verification = urllib.request.Request(
+        "https://evmgsqdrojxppxknrzfk.supabase.co/functions/v1/ippatsu-assistant",
+        data=json.dumps(check).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(verification, timeout=10) as response:
+            valid = json.load(response).get("valid") is True
+    except urllib.error.HTTPError as error:
+        abort(403 if error.code in (400, 401, 403) else 503)
+    except (OSError, ValueError):
+        abort(503)
+    if not valid:
+        abort(403)
+    result = build_search_response(query, portal=True)
+    return jsonify(cards=result["cards"])
 
 
 @app.route("/healthz")
